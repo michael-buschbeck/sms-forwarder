@@ -19,6 +19,11 @@
 
 #define SIM_PIN "0000"
 
+const char* Destinations[] =
+{
+    "+491701234567",
+};
+
 enum struct ModemResult : uint8_t
 {
     OK          = 0,
@@ -248,6 +253,11 @@ private:
 };
 //|XXX ==============================================================================================================
 
+constexpr uint16_t swapBytes(uint16_t value)
+{
+    return (value >> 8) | (value << 8);
+}
+
 unsigned long ModemTimeoutStart = 0;
 unsigned long ModemTimeout = 0;
 
@@ -275,15 +285,19 @@ void discardRead(Stream& stream)
 template<typename command_char_t>
 void sendCommandToModem(const command_char_t* command, unsigned long responseTimeout)
 {
-    ModemSerial.println(command);
+    ModemSerial.print(command);
+    ModemSerial.print('\r');
+
     startModemTimeout(responseTimeout);
 }
 
-template<typename command_char_t, typename arguments_char_t>
-void sendCommandToModem(const command_char_t* command, const arguments_char_t* arguments, unsigned long responseTimeout)
+template<typename command_char_t, typename arguments_t>
+void sendCommandToModem(const command_char_t* command, const arguments_t arguments, unsigned long responseTimeout)
 {
     ModemSerial.print(command);
-    ModemSerial.println(arguments);
+    ModemSerial.print(arguments);
+    ModemSerial.print('\r');
+
     startModemTimeout(responseTimeout);
 }
 
@@ -332,22 +346,23 @@ size_t readCharactersFromModemUntil(char* buffer, size_t bufferSize, char stopCh
 template<typename char_predicate_t>
 size_t readCharactersFromModemWhile(char* buffer, size_t bufferSize, char_predicate_t isCharacterToRead)
 {
-    size_t bufferOffset = 0;
-    size_t bufferOffsetEnd = bufferSize - 1;
+    char* characterPtr = buffer;
+    char* characterPtrEnd = buffer + bufferSize - 1;
 
-    while (bufferOffset < bufferOffsetEnd)
+    while (characterPtr < characterPtrEnd)
     {
-        if (readCharacterFromModem(buffer[bufferOffset], isCharacterToRead))
+        if (readCharacterFromModem(*characterPtr, isCharacterToRead))
         {
-            bufferOffset++;
+            characterPtr++;
             continue;
         }
 
         break;
     }
 
-    buffer[bufferOffset] = '\0';
-    return bufferOffset;
+    *characterPtr = '\0';
+
+    return static_cast<size_t>(characterPtr - buffer);
 }
 
 template<typename char_predicate_t>
@@ -503,9 +518,12 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
     {
         case Encoding::UTF8:
         {
-            for (size_t bufferOffset = 0; bufferOffset < bufferSize; ++bufferOffset)
+            const char* characterPtr = buffer;
+            const char* characterPtrEnd = buffer + bufferSize;
+
+            for (; characterPtr < characterPtrEnd; ++characterPtr)
             {
-                char character = buffer[bufferOffset];
+                char character = *characterPtr;
 
                 if (character == '\0')
                 {
@@ -519,13 +537,12 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
 
         case Encoding::UCS2LE:
         {
-            size_t bufferOffsetEnd = bufferSize & 0xFFFE;
+            const wchar_t* bufferCodepointPtr = reinterpret_cast<const wchar_t*>(buffer);
+            const wchar_t* bufferCodepointPtrEnd = reinterpret_cast<const wchar_t*>(buffer + (bufferSize & ~1));
 
-            for (size_t bufferOffset = 0; bufferOffset < bufferOffsetEnd; bufferOffset += sizeof(wchar_t))
+            for (; bufferCodepointPtr < bufferCodepointPtrEnd; ++bufferCodepointPtr)
             {
-                wchar_t codepoint =
-                    static_cast<unsigned char>(buffer[bufferOffset]) |
-                    static_cast<unsigned char>(buffer[bufferOffset + 1]) << 8;
+                wchar_t codepoint = *bufferCodepointPtr;
 
                 if (codepoint == '\0')
                 {
@@ -539,14 +556,13 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
 
         case Encoding::UCS2BE:
         {
-            size_t bufferOffsetEnd = bufferSize & 0xFFFE;
+            const wchar_t* bufferCodepointPtr = reinterpret_cast<const wchar_t*>(buffer);
+            const wchar_t* bufferCodepointPtrEnd = reinterpret_cast<const wchar_t*>(buffer + (bufferSize & ~1));
 
-            for (size_t bufferOffset = 0; bufferOffset < bufferOffsetEnd; bufferOffset += sizeof(wchar_t))
+            for (; bufferCodepointPtr < bufferCodepointPtrEnd; ++bufferCodepointPtr)
             {
-                wchar_t codepoint =
-                    static_cast<unsigned char>(buffer[bufferOffset]) << 8 |
-                    static_cast<unsigned char>(buffer[bufferOffset + 1]);
-                
+                wchar_t codepoint = swapBytes(*bufferCodepointPtr);
+
                 if (codepoint == '\0')
                 {
                     break;
@@ -559,11 +575,14 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
 
         case Encoding::GSMBYTES:
         {
+            const char* characterPtr = buffer;
+            const char* characterPtrEnd = buffer + bufferSize;
+
             bool isExtended = false;
 
-            for (size_t bufferOffset = 0; bufferOffset < bufferSize; ++bufferOffset)
+            for (; characterPtr < characterPtrEnd; ++characterPtr)
             {
-                unsigned char character = buffer[bufferOffset];
+                unsigned char character = *characterPtr;
 
                 if (character > '\x7F')
                 {
@@ -734,19 +753,16 @@ bool isHexDigit(char character)
            (character >= 'a' && character <= 'f');
 }
 
-template<typename numeric_t>
-numeric_t parseHexFromModem(numeric_t resultOnError = static_cast<numeric_t>(-1), size_t numHexDigits = 2 * sizeof(numeric_t))
+uint8_t parseHexFromModem(uint8_t resultOnError = 0xFF)
 {
-    numeric_t result = 0;
+    uint8_t result = 0;
 
-    while (numHexDigits > 0)
+    for (uint8_t numHexDigits = 2; numHexDigits > 0; --numHexDigits)
     {
         char hexDigit;
 
         if (readCharacterFromModem(hexDigit, isHexDigit))
         {
-            numHexDigits--;
-
             // 0..9: 00110000..00111001 (digit & 0x0F)
             // A..F: 01000001..01000110 (digit & 0x0F + 9)
             // a..f: 01100001..01100110 (digit & 0x0F + 9)
@@ -764,33 +780,45 @@ numeric_t parseHexFromModem(numeric_t resultOnError = static_cast<numeric_t>(-1)
 
 bool skipHexFromModem(size_t numHexDigits)
 {
-    while (numHexDigits > 0)
+    for (; numHexDigits > 0; --numHexDigits)
     {
-        if (skipCharacterFromModem(isHexDigit))
+        if (!skipCharacterFromModem(isHexDigit))
         {
-            numHexDigits--;
-            continue;
+            return false;
         }
-
-        return false;
     }
 
     return true;
 }
 
-uint8_t parseGSMAlphaFromModem(char* buffer, size_t bufferSize, uint8_t charactersToParse)
+void sendHexToModem(uint8_t value)
 {
+    for (uint8_t numHexDigits = 2; numHexDigits > 0; --numHexDigits)
+    {
+        char hexDigit;
+        
+        hexDigit = value >> 4;
+        hexDigit += (hexDigit < 10) ? '0' : ('A' - 10);
+
+        ModemSerial.write(hexDigit);
+
+        value <<= 4;
+    }
+}
+
+uint8_t parseGSMAlphaFromModem(char* characterBuffer, size_t characterBufferSize, uint8_t charactersToParse)
+{
+    uint8_t characterPosition = 0;
+
     char character = '\0';
     char characterRemainder = '\0';
 
-    uint8_t characterPosition = 0;
-
-    size_t bufferOffset = 0;
-    size_t bufferOffsetEnd = bufferSize - 1;
+    char* characterPtr = characterBuffer;
+    char* characterPtrEnd = characterBuffer + characterBufferSize - 1;
 
     for (; charactersToParse > 0; --charactersToParse)
     {
-        uint8_t octet = parseHexFromModem<uint8_t>();
+        uint8_t octet = parseHexFromModem();
 
         switch (characterPosition++)
         {
@@ -830,9 +858,9 @@ uint8_t parseGSMAlphaFromModem(char* buffer, size_t bufferSize, uint8_t characte
                 break;
         }
 
-        if (bufferOffset < bufferOffsetEnd)
+        if (characterPtr < characterPtrEnd)
         {
-            buffer[bufferOffset++] = character;
+            *characterPtr++ = character;
         }
 
         if (characterPosition == 7)
@@ -842,9 +870,9 @@ uint8_t parseGSMAlphaFromModem(char* buffer, size_t bufferSize, uint8_t characte
                 break;
             }
 
-            if (bufferOffset < bufferOffsetEnd)
+            if (characterPtr < characterPtrEnd)
             {
-                buffer[bufferOffset++] = characterRemainder;
+                *characterPtr++ = characterRemainder;
             }
 
             characterPosition = 0;
@@ -852,9 +880,78 @@ uint8_t parseGSMAlphaFromModem(char* buffer, size_t bufferSize, uint8_t characte
         }
     }
 
-    buffer[bufferOffset] = '\xFF';
+    *characterPtr = '\xFF';
 
-    return isModemTimeout() ? 0 : static_cast<uint8_t>(bufferOffset);
+    return isModemTimeout() ? 0 : static_cast<uint8_t>(characterPtr - characterBuffer);
+}
+
+void sendGSMAlphaToModem(const char* characters, uint8_t charactersToWrite)
+{
+    uint8_t characterPosition = 0;
+
+    uint8_t octet = 0x00;
+
+    const char* characterPtr = characters;
+    const char* characterPtrEnd = characters + charactersToWrite;
+
+    while (characterPtr < characterPtrEnd)
+    {
+        unsigned char character = *characterPtr++ & 0x7F;
+
+        switch (characterPosition++)
+        {
+            case 0:
+                octet = 0x80 | character;
+                break;
+
+            case 1:
+                octet = (octet & 0x7F) | (character & 0x01) << 7;
+                sendHexToModem(octet);
+                octet = 0xC0 | (character >> 1);
+                break;
+
+            case 2:
+                octet = (octet & 0x3F) | (character & 0x03) << 6;
+                sendHexToModem(octet);
+                octet = 0xE0 | (character >> 2);
+                break;
+
+            case 3:
+                octet = (octet & 0x1F) | (character & 0x07) << 5;
+                sendHexToModem(octet);
+                octet = 0xF0 | (character >> 3);
+                break;
+
+            case 4:
+                octet = (octet & 0x0F) | (character & 0x0F) << 4;
+                sendHexToModem(octet);
+                octet = 0xF8 | (character >> 4);
+                break;
+
+            case 5:
+                octet = (octet & 0x07) | (character & 0x1F) << 3;
+                sendHexToModem(octet);
+                octet = 0xFC | (character >> 5);
+                break;
+
+            case 6:
+                octet = (octet & 0x03) | (character & 0x3F) << 2;
+                sendHexToModem(octet);
+                octet = 0xFE | (character >> 6);
+                break;
+
+            case 7:
+                octet = (octet & 0x01) | character << 1;
+                sendHexToModem(octet);
+                characterPosition = 0;
+                break;
+        }
+    }
+
+    if (characterPosition != 0)
+    {
+        sendHexToModem(octet);
+    }
 }
 
 bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& senderLengthOut, char* messageBuffer, size_t messageBufferSize, Encoding& messageEncodingOut, uint8_t& messageLengthOut)
@@ -870,7 +967,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
     //   byte  0:    number of octets
     //   bytes 1..n: SMS message center address
     {
-        uint8_t dispatcherAddressLength = parseHexFromModem<uint8_t>();
+        uint8_t dispatcherAddressLength = parseHexFromModem();
 
         if (dispatcherAddressLength > 12 || !skipHexFromModem(2 * dispatcherAddressLength))
         {
@@ -887,7 +984,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
     //   bit  6:    TP-UDHI (user data header indicator)
     //   bit  7:    TP-RP   (reply path)
     {
-        uint8_t header = parseHexFromModem<uint8_t>();
+        uint8_t header = parseHexFromModem();
 
         const uint8_t TP_MTI_MASK        = 0x03;
         const uint8_t TP_MTI_SMS_DELIVER = 0x00;
@@ -908,12 +1005,10 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
     //   byte  1, bit  7:    type of address header fixed bit
     //   byte  1, bits 4..6: type of number
     //   byte  1, bits 0..3: numbering plan identification
-    //   byte  1, bits 4..6: type of number
-    //   byte  1, bit  7:    always set
     //   bytes 2..n:         originating address encoded as per type of number
     {
-        uint8_t senderAddressSemiOctets = parseHexFromModem<uint8_t>();
-        uint8_t senderAddressType = parseHexFromModem<uint8_t>();
+        uint8_t senderAddressSemiOctets = parseHexFromModem();
+        uint8_t senderAddressType = parseHexFromModem();
 
         if (senderAddressSemiOctets > 20)
         {
@@ -932,34 +1027,34 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
         {
             case ADDRESS_TYPE_NUMBER_INTERNATIONAL:
             {
-                size_t senderBufferOffset = 0;
-                size_t senderBufferOffsetEnd = senderBufferSize - 1;
+                char* senderCharacterPtr = senderBuffer;
+                char* senderCharacterPtrEnd = senderBuffer + senderBufferSize - 1;
 
-                if (senderBufferOffset < senderBufferOffsetEnd)
+                if (senderCharacterPtr < senderCharacterPtrEnd)
                 {
-                    senderBuffer[senderBufferOffset++] = '+';
+                    *senderCharacterPtr++ = '+';
                 }
 
                 for (uint8_t senderAddressOctets = (senderAddressSemiOctets + 1) >> 1; senderAddressOctets > 0; --senderAddressOctets)
                 {
-                    uint8_t senderAddressOctet = parseHexFromModem<uint8_t>();
+                    uint8_t senderAddressOctet = parseHexFromModem();
 
-                    if (senderBufferOffset < senderBufferOffsetEnd)
+                    if (senderCharacterPtr < senderCharacterPtrEnd)
                     {
-                        senderBuffer[senderBufferOffset++] = '0' + (senderAddressOctet & 0x0F);
+                        *senderCharacterPtr++ = '0' + (senderAddressOctet & 0x0F);
                     }
 
                     senderAddressOctet >>= 4;
 
-                    if (senderBufferOffset < senderBufferOffsetEnd && senderAddressOctet != 0x0F)
+                    if (senderCharacterPtr < senderCharacterPtrEnd && senderAddressOctet != 0x0F)
                     {
-                        senderBuffer[senderBufferOffset++] = '0' + senderAddressOctet;
+                        *senderCharacterPtr++ = '0' + senderAddressOctet;
                     }
                 }
 
-                senderBuffer[senderBufferOffset] = '\xFF';
+                *senderCharacterPtr = '\xFF';
 
-                senderLengthOut = static_cast<uint8_t>(senderBufferOffset);
+                senderLengthOut = static_cast<uint8_t>(senderCharacterPtr - senderBuffer);
             }
             break;
 
@@ -973,7 +1068,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
 
                 for (uint8_t senderAddressOctets = (senderAddressSemiOctets + 1) >> 1; senderAddressOctets > 0; --senderAddressOctets)
                 {
-                    uint8_t senderAddressOctet = parseHexFromModem<uint8_t>();
+                    uint8_t senderAddressOctet = parseHexFromModem();
 
                     if (senderCharacterPtr < senderCharacterPtrEnd)
                     {
@@ -1028,7 +1123,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
 
     // Read TP-DCS (data coding scheme)
     {
-        messageCoding = parseHexFromModem<uint8_t>();
+        messageCoding = parseHexFromModem();
 
         if (messageCoding != TP_DCS_GSM7BIT &&
             messageCoding != TP_DCS_UCS2BE)
@@ -1056,18 +1151,18 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
     //   byte  0:    TP-UDL (user data length)
     //   bytes 1..n: TP-UD  (user data)
     {
-        uint8_t messageCharactersToRead = parseHexFromModem<uint8_t>();
+        uint8_t messageLength = parseHexFromModem();
 
-        if (messageCharactersToRead > 160)
+        if (messageLength > 160)
         {
             return false;
         }
 
         if (hasUserDataHeader)
         {
-            uint8_t userDataHeaderLength = parseHexFromModem<uint8_t>();
+            uint8_t userDataHeaderLength = parseHexFromModem();
 
-            if (userDataHeaderLength + 1 > messageCharactersToRead)
+            if (userDataHeaderLength + 1 > messageLength)
             {
                 return false;
             }
@@ -1086,7 +1181,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
 
             skipHexFromModem(2 * userDataHeaderLength);
 
-            messageCharactersToRead -= userDataHeaderLength + 1;
+            messageLength -= userDataHeaderLength + 1;
         }
 
         switch (messageCoding)
@@ -1094,7 +1189,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
             case TP_DCS_GSM7BIT:
             {
                 messageEncodingOut = Encoding::GSMBYTES;
-                messageLengthOut = parseGSMAlphaFromModem(messageBuffer, messageBufferSize, messageCharactersToRead);
+                messageLengthOut = parseGSMAlphaFromModem(messageBuffer, messageBufferSize, messageLength);
 
                 if (messageLengthOut == 0)
                 {
@@ -1107,28 +1202,281 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
             {
                 messageEncodingOut = Encoding::UCS2BE;
 
-                uint8_t messageBufferOffset = 0;
-                uint8_t messageBufferOffsetEnd = messageBufferSize - sizeof(wchar_t);
+                char* messageBytePtr = messageBuffer;
+                char* messageBytePtrEnd = messageBuffer + messageBufferSize - sizeof(wchar_t);
 
-                for (; messageCharactersToRead > 0; --messageCharactersToRead)
+                for (; messageLength > 0; --messageLength)
                 {
-                    uint8_t messageByte = parseHexFromModem<uint8_t>();
+                    uint8_t messageByte = parseHexFromModem();
 
-                    if (messageBufferOffset < messageBufferOffsetEnd)
+                    if (messageBytePtr < messageBytePtrEnd)
                     {
-                        messageBuffer[messageBufferOffset++] = messageByte;
+                        *messageBytePtr++ = messageByte;
                     }
                 }
 
-                reinterpret_cast<wchar_t&>(messageBuffer[messageBufferOffset]) = '\0';
+                *reinterpret_cast<wchar_t*>(messageBytePtr) = '\0';
 
-                messageLengthOut = messageBufferOffset;
+                messageLengthOut = static_cast<uint8_t>(messageBytePtr - messageBuffer);
             }
             break;
         }
     }
 
     return !isModemTimeout();
+}
+
+size_t computeSMSPDUSize(const char* destination, size_t destinationLength, Encoding messageEncoding, size_t messageLength)
+{
+    size_t size = 0;
+
+    // SMSC address is not included
+
+    size += 1;  // TP-MTI, TP-RD, TP-VPF, TP-SRR, TP-UDHI, TP-RP
+    size += 1;  // TP-MR
+    size += 1;  // TP-DA address length
+    size += 1;  // TP-DA type of address
+
+    if (destinationLength == 0)
+    {
+        // Empty destination is invalid
+        return 0;
+    }
+
+    const char* destinationCharacterPtr = destination;
+    const char* destinationCharacterPtrEnd = destination + destinationLength;
+
+    if (*destinationCharacterPtr == '+')
+    {
+        if (destinationLength < 8)
+        {
+            // Destination too short for an international number
+            return 0;
+        }
+
+        // Destination without leading '+', two digits per octet, rounded up
+        size += destinationLength >> 1;
+
+        destinationCharacterPtr++;
+    }
+    else
+    {
+        // Destination number as is, two digits per octet, rounded up
+        size += (destinationLength + 1) >> 1;
+    }
+
+    while (destinationCharacterPtr < destinationCharacterPtrEnd)
+    {
+        char destinationCharacter = *destinationCharacterPtr++;
+
+        if (destinationCharacter < '0' ||
+            destinationCharacter > '9')
+        {
+            // Invalid non-digit character in destination
+            return 0;
+        }
+    }
+
+    size += 1;  // TP-PID
+    size += 1;  // TP-DCS
+    size += 0;  // TP-VP [not present]
+    size += 1;  // TP-UDL
+
+    switch (messageEncoding)
+    {
+        case Encoding::GSMBYTES:
+            // Message as 7 bits per input message byte, rounded up
+            size += ((messageLength + 1) * 7) / 8;
+            break;
+
+        case Encoding::UCS2BE:
+            // Message as one 16 bit word per two input message bytes
+            size += messageLength;
+            break;
+
+        default:
+            // Unsupported message encoding
+            return 0;
+    }
+
+    return size;
+}
+
+bool sendSMSPDUToModem(const char* destination, size_t destinationLength, const char* message, Encoding messageEncoding, size_t messageLength)
+{
+    // Send SMSC address:
+    //   byte 0: number of octets
+    {
+        sendHexToModem(0);
+    }
+
+    // Send message header:
+    //   bits 0..1: TP_MTI  (message type indicator)
+    //   bit  2:    TP_RD   (reject duplicates)
+    //   bits 3..4: TP_VPF  (validity period format)
+    //   bit  5:    TP_SRR  (status report request)
+    //   bit  6:    TP_UDHI (user data header indicator)
+    //   bit  7:    TP_RP   (reply path)
+    {
+        const uint8_t TP_MTI_SMS_SUBMIT    = 0x01;  // bits 0..1
+        const uint8_t TP_RD_NOT_REQUESTED  = 0x00;  // bit  2
+        const uint8_t TP_VPF_NOT_PRESENT   = 0x00;  // bits 3..4
+        const uint8_t TP_SRR_NOT_REQUESTED = 0x00;  // bit  5
+        const uint8_t TP_UDHI_NOT_PRESENT  = 0x00;  // bit  6
+        const uint8_t TP_RP_NOT_SET        = 0x00;  // bit  7
+
+        sendHexToModem(
+            TP_MTI_SMS_SUBMIT |
+            TP_RD_NOT_REQUESTED |
+            TP_VPF_NOT_PRESENT |
+            TP_SRR_NOT_REQUESTED |
+            TP_UDHI_NOT_PRESENT |
+            TP_RP_NOT_SET);
+    }
+
+    // Send TP-MR (message reference)
+    {
+        // Automatically substituted by the modem
+        sendHexToModem(0);
+    }
+
+    // Send TP-DA (destination address):
+    //   byte  0:            number of useful semi-octets within the value field
+    //   byte  1, bit  7:    type of address header fixed bit
+    //   byte  1, bits 4..6: type of number
+    //   byte  1, bits 0..3: numbering plan identification
+    //   bytes 2..n:         originating address encoded as per type of number
+    {
+        if (destinationLength == 0)
+        {
+            // Cancel sending
+            ModemSerial.write(0x1B);
+            return false;
+        }
+
+        const uint8_t ADDRESS_FIXEDBIT                  = 0x80;
+        const uint8_t ADDRESS_TYPE_NUMBER_INTERNATIONAL = 0x10;
+        const uint8_t ADDRESS_TYPE_NUMBER_NATIONAL      = 0x20;
+        const uint8_t ADDRESS_NUMBERING_PLAN_TELEPHONE  = 0x01;
+
+        const char* destinationCharacterPtr = destination;
+        const char* destinationCharacterPtrEnd = destination + destinationLength;
+
+        if (*destinationCharacterPtr == '+')
+        {
+            sendHexToModem(destinationLength - 1);
+
+            sendHexToModem(
+                ADDRESS_FIXEDBIT |
+                ADDRESS_TYPE_NUMBER_INTERNATIONAL |
+                ADDRESS_NUMBERING_PLAN_TELEPHONE);
+            
+            destinationCharacterPtr++;
+        }
+        else
+        {
+            sendHexToModem(destinationLength);
+
+            sendHexToModem(
+                ADDRESS_FIXEDBIT |
+                ADDRESS_TYPE_NUMBER_NATIONAL |
+                ADDRESS_NUMBERING_PLAN_TELEPHONE);
+        }
+
+        while (destinationCharacterPtr < destinationCharacterPtrEnd)
+        {
+            uint8_t destinationAddressOctet =
+                (*destinationCharacterPtr++ - '0');
+
+            destinationAddressOctet |=
+                destinationCharacterPtr < destinationCharacterPtrEnd
+                    ? (*destinationCharacterPtr++ - '0') << 4 : 0xF0;
+
+            sendHexToModem(destinationAddressOctet);
+        }
+    }
+
+    // Send TP-PID (protocol identifier):
+    //   bits 6..7: type
+    //   bit  5:    telematic interworking
+    //   bits 0..4: telematic device
+    {
+        const uint8_t TP_PID_TYPE_STANDARD   = 0x00;  // bits 6..7
+        const uint8_t TP_PID_NO_INTERWORKING = 0x00;  // bit  5
+
+        sendHexToModem(
+            TP_PID_TYPE_STANDARD |
+            TP_PID_NO_INTERWORKING);
+    }
+
+    uint8_t messageCoding;
+
+    const uint8_t TP_DCS_GSM7BIT = 0x00;
+    const uint8_t TP_DCS_UCS2BE  = 0x08;
+
+    // Send TP-DCS (data coding scheme)
+    {
+        switch (messageEncoding)
+        {
+            case Encoding::GSMBYTES:
+                messageCoding = TP_DCS_GSM7BIT;
+                break;
+
+            case Encoding::UCS2BE:
+                messageCoding = TP_DCS_UCS2BE;
+                break;
+
+            default:
+                // Cancel sending
+                ModemSerial.write(0x1B);
+                return false;
+        }
+
+        sendHexToModem(messageCoding);
+    }
+
+    // Send message:
+    //   byte  0:    TP-UDL (user data length)
+    //   bytes 1..n: TP-UD  (user data)
+    {
+        switch (messageCoding)
+        {
+            case TP_DCS_GSM7BIT:
+            {
+                sendHexToModem(messageLength);
+                sendGSMAlphaToModem(message, messageLength);
+            }
+            break;
+
+            case TP_DCS_UCS2BE:
+            {
+                messageLength &= ~1;
+
+                sendHexToModem(messageLength);
+
+                const char* messageBytePtr = message;
+                const char* messageBytePtrEnd = message + messageLength;
+
+                while (messageBytePtr < messageBytePtrEnd)
+                {
+                    sendHexToModem(*messageBytePtr++);
+                    sendHexToModem(*messageBytePtr++);
+                }
+            }
+            break;
+
+            default:
+            {
+                // Cancel sending
+                ModemSerial.write(0x1B);
+            }
+            return false;
+        }
+    }
+
+    // Confirm sending
+    ModemSerial.write(0x1A);
+    return true;
 }
 
 //|XXX
@@ -1201,11 +1549,22 @@ void setup()
     //|XXX
     if (true)
     {
+        const char destination[] = "+491703104726";
+        size_t destinationLength = sizeof(destination) - 1;
+
+        const __FlashStringHelper* deliverPDUs[] =
+        {
+            F("0791947101670000040C9194713001746200005220421191954019C8329BFD06D1D1657939A49896C76F3719C44EBBCB21\r\n"),
+            F("0791947101670000040C919471300174620000522042119195405661BA0E0022BFD9ECB05C2700CDE73A0F681C9697E9BA0D05249687C7E5B96E83DAA440E2F078ADDBBC40627978BC2ED3E7BA0D6FE303D1D36C7259B7E981E0697859B70182CA75F95BB72903\r\n"),
+            F("0791021197003899440ED0657A7A1E6687E93408610192016390004205000365030106440642062F002006270633062A064706440643062A0020064306440020062706440648062D062F0627062A0020062706440645062C06270646064A\r\n"),
+            F("0791947101670000040C919471300174620008523030714172404600540065007300740020006D0069007400200041006B007A0065006E0074003A002000E100E0000A0055006D006C0061007500740065003A002000E400F600FC00C400D600DC\r\n"),
+        };
+
+        for (const __FlashStringHelper* deliverPDU : deliverPDUs)
         {
             startModemTimeout(300);
             
-            FlashStringStream PDUStream(F("0791947101670000040C9194713001746200005220421191954019C8329BFD06D1D1657939A49896C76F3719C44EBBCB21\r\n"));
-            XXX_ModemSerialScope PDUStreamScope(PDUStream);
+            FlashStringStream PDUStream(deliverPDU);
 
             char sender[20+1];
             uint8_t senderLength;
@@ -1214,7 +1573,14 @@ void setup()
             Encoding messageEncoding;
             uint8_t messageLength;
 
-            if (parseSMSPDUFromModem(sender, sizeof(sender), senderLength, message, sizeof(message), messageEncoding, messageLength))
+            bool parseSuccess;
+
+            {
+                XXX_ModemSerialScope PDUStreamScope(PDUStream);
+                parseSuccess = parseSMSPDUFromModem(sender, sizeof(sender), senderLength, message, sizeof(message), messageEncoding, messageLength);
+            }
+
+            if (parseSuccess)
             {
                 Serial.print(F("Test: SMS sender: "));
                 printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
@@ -1222,87 +1588,22 @@ void setup()
                 Serial.print(static_cast<uint8_t>(messageEncoding));
                 Serial.print(F("): "));
                 printlnEncoded(Serial, message, sizeof(message), messageEncoding);
-            }
-            else
-            {
-                Serial.println(F("Test: Failed to parse SMS PDU"));
-            }
-        }
-        {
-            startModemTimeout(300);
-            
-            FlashStringStream PDUStream(F("0791947101670000040C919471300174620000522042119195405661BA0E0022BFD9ECB05C2700CDE73A0F681C9697E9BA0D05249687C7E5B96E83DAA440E2F078ADDBBC40627978BC2ED3E7BA0D6FE303D1D36C7259B7E981E0697859B70182CA75F95BB72903\r\n"));
-            XXX_ModemSerialScope PDUStreamScope(PDUStream);
 
-            char sender[20+1];
-            uint8_t senderLength;
+                size_t submitPDUSize = computeSMSPDUSize(destination, destinationLength, messageEncoding, messageLength);
 
-            char message[160+1];
-            Encoding messageEncoding;
-            uint8_t messageLength;
+                if (submitPDUSize != 0)
+                {
+                    Serial.print(F("Test: Send PDU size: "));
+                    Serial.println(submitPDUSize);
+                    Serial.print(F("Test: Send PDU: "));
 
-            if (parseSMSPDUFromModem(sender, sizeof(sender), senderLength, message, sizeof(message), messageEncoding, messageLength))
-            {
-                Serial.print(F("Test: SMS sender: "));
-                printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
-                Serial.print(F("Test: SMS message (encoding "));
-                Serial.print(static_cast<uint8_t>(messageEncoding));
-                Serial.print(F("): "));
-                printlnEncoded(Serial, message, sizeof(message), messageEncoding);
-            }
-            else
-            {
-                Serial.println(F("Test: Failed to parse SMS PDU"));
-            }
-        }
-        {
-            startModemTimeout(300);
-            
-            FlashStringStream PDUStream(F("0791021197003899440ED0657A7A1E6687E93408610192016390004205000365030106440642062F002006270633062A064706440643062A0020064306440020062706440648062D062F0627062A0020062706440645062C06270646064A\r\n"));
-            XXX_ModemSerialScope PDUStreamScope(PDUStream);
+                    {
+                        XXX_ModemSerialScope ConsoleScope(Serial);
+                        sendSMSPDUToModem(destination, destinationLength, message, messageEncoding, messageLength);
+                    }
 
-            char sender[20+1];
-            uint8_t senderLength;
-
-            char message[160+1];
-            Encoding messageEncoding;
-            uint8_t messageLength;
-
-            if (parseSMSPDUFromModem(sender, sizeof(sender), senderLength, message, sizeof(message), messageEncoding, messageLength))
-            {
-                Serial.print(F("Test: SMS sender: "));
-                printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
-                Serial.print(F("Test: SMS message (encoding "));
-                Serial.print(static_cast<uint8_t>(messageEncoding));
-                Serial.print(F("): "));
-                printlnEncoded(Serial, message, sizeof(message), messageEncoding);
-            }
-            else
-            {
-                Serial.println(F("Test: Failed to parse SMS PDU"));
-            }
-        }
-        {
-            startModemTimeout(300);
-            
-            FlashStringStream PDUStream(F("0791947101670000040C919471300174620008523030714172404600540065007300740020006D0069007400200041006B007A0065006E0074003A002000E100E0000A0055006D006C0061007500740065003A002000E400F600FC00C400D600DC\r\n"));
-            XXX_ModemSerialScope PDUStreamScope(PDUStream);
-
-            char sender[20+1];
-            uint8_t senderLength;
-
-            char message[160+1];
-            Encoding messageEncoding;
-            uint8_t messageLength;
-
-            if (parseSMSPDUFromModem(sender, sizeof(sender), senderLength, message, sizeof(message), messageEncoding, messageLength))
-            {
-                Serial.print(F("Test: SMS sender: "));
-                printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
-                Serial.print(F("Test: SMS message (encoding "));
-                Serial.print(static_cast<uint8_t>(messageEncoding));
-                Serial.print(F("): "));
-                printlnEncoded(Serial, message, sizeof(message), messageEncoding);
+                    Serial.println();
+                }
             }
             else
             {
@@ -1329,11 +1630,13 @@ void loop()
         return;
     }
 
-    char unsolicitedResultCode[9+1];
+    char resultCode[9+1];
 
-    if (readCharactersFromModemUntil(unsolicitedResultCode, sizeof(unsolicitedResultCode), ':'))
+    if (readCharactersFromModemUntil(resultCode, sizeof(resultCode), ':'))
     {
-        if (strcmp_P(unsolicitedResultCode, PSTR("CMT")) == 0)
+        skipCharacterFromModem(':');
+
+        if (strcmp_P(resultCode, PSTR("CMT")) == 0)
         {
             Serial.println(F("GSM: Received SMS"));
 
@@ -1365,7 +1668,101 @@ void loop()
                 Serial.print(F("GSM: SMS message: "));
                 printlnEncoded(Serial, message, sizeof(message), messageEncoding);
 
-                //|XXX enqueue forwarded SMS
+                //|XXX
+                Serial.print(F("GSM: SMS message encoding: "));
+                Serial.println(static_cast<uint8_t>(messageEncoding));
+                Serial.print(F("GSM: SMS message length: "));
+                Serial.println(messageLength);
+
+                switch (messageEncoding)
+                {
+                    case Encoding::GSMBYTES:
+                    {
+                        char* messageCharacterPtr = message + messageLength;
+                        char* messageCharacterPtrEnd = message + sizeof(message) - 1;
+
+                        if (messageCharacterPtr + senderLength + 2 < messageCharacterPtrEnd)
+                        {
+                            *messageCharacterPtr++ = '\n';
+                            *messageCharacterPtr++ = '\n';
+
+                            memcpy(messageCharacterPtr, sender, senderLength);
+                            messageCharacterPtr += senderLength;
+                        }
+
+                        *messageCharacterPtr = '\xFF';
+
+                        messageLength = messageCharacterPtr - message;
+                    }
+                    break;
+
+                    case Encoding::UCS2BE:
+                    {
+                        wchar_t* messageCodepointPtr = reinterpret_cast<wchar_t*>(message + messageLength);
+                        wchar_t* messageCodepointPtrEnd = reinterpret_cast<wchar_t*>(message + sizeof(message)) - 1;
+
+                        if (messageCodepointPtr + senderLength + 2 < messageCodepointPtrEnd)
+                        {
+                            *messageCodepointPtr++ = swapBytes('\n');
+                            *messageCodepointPtr++ = swapBytes('\n');
+
+                            bool isExtended = false;
+
+                            char* senderCharacterPtr = sender;
+                            char* senderCharacterPtrEnd = sender + senderLength;
+
+                            for (; senderCharacterPtr < senderCharacterPtrEnd; ++senderCharacterPtr)
+                            {
+                                unsigned char senderCharacter = *senderCharacterPtr;
+
+                                if (senderCharacter > '\x7F')
+                                {
+                                    break;
+                                }
+
+                                if (senderCharacter == '\x1B')
+                                {
+                                    isExtended = true;
+                                    continue;
+                                }
+
+                                wchar_t senderCodepoint = lookupUnicodeForGSM(senderCharacter, isExtended);
+                                *messageCodepointPtr++ = swapBytes(senderCodepoint);
+
+                                isExtended = false;
+                            }
+                        }
+                        
+                        *messageCodepointPtr = '\0';
+
+                        messageLength = reinterpret_cast<char*>(messageCodepointPtr) - message;
+                    }
+                    break;
+
+                    default: break;
+                }
+
+                Serial.print(F("SMSForwarder: Outgoing SMS message: "));
+                printlnEncoded(Serial, message, sizeof(message), messageEncoding);
+
+                for (const char* destination : Destinations)
+                {
+                    Serial.print(F("SMSForwarder: Forwarding to "));
+                    Serial.println(destination);
+
+                    size_t destinationLength = strlen(destination);
+                    size_t submitPDUSize = computeSMSPDUSize(destination, destinationLength, messageEncoding, messageLength);
+
+                    if (submitPDUSize > 0)
+                    {
+                        sendCommandToModem(F("AT+CMGS="), submitPDUSize, 120000);
+                        sendSMSPDUToModem(destination, destinationLength, message, messageEncoding, messageLength);
+                    }
+                    else
+                    {
+                        Serial.println(F("SMSForwarder: Cannot send SMS because of invalid SMS message information"));
+                    }
+                }
 
                 return;
             }
@@ -1377,8 +1774,40 @@ void loop()
             //*/
         }
 
-        Serial.print(F("GSM: Unsupported unsolicited result code: "));
-        Serial.println(unsolicitedResultCode);
+        if (strcmp_P(resultCode, PSTR("CMGS")) == 0)
+        {
+            char messageReferenceBuffer[3+1];
+
+            if (readLineFromModem(messageReferenceBuffer, sizeof(messageReferenceBuffer)))
+            {
+                Serial.print(F("GSM: Successfully sent SMS with message reference: "));
+                Serial.println(messageReferenceBuffer);
+            }
+
+            discardResponseFromModem();
+            return;
+        }
+
+        if (strcmp_P(resultCode, PSTR("CMS ERROR")) == 0)
+        {
+            char error[10+1];
+
+            if (readCharactersFromModemUntil(error, sizeof(error), '\r'))
+            {
+                Serial.print(F("GSM: Error sending SMS: "));
+                Serial.println(error);
+            }
+            else
+            {
+                Serial.println(F("GSM: Unknown error sending SMS"));
+            }
+
+            discardResponseFromModem();
+            return;
+        }
+
+        Serial.print(F("GSM: Unknown result code: "));
+        Serial.println(resultCode);
         return;
     }
 
