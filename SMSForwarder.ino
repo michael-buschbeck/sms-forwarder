@@ -24,6 +24,12 @@ const char* Destinations[] =
     "+491701234567",
 };
 
+struct ModemSerialState
+{
+    enum : int { NoData      = -1 };
+    enum : int { EndOfStream = -2 };
+};
+
 enum struct ModemResult : uint8_t
 {
     OK          = 0,
@@ -272,6 +278,54 @@ bool isModemTimeout()
     return millis() - ModemTimeoutStart >= ModemTimeout;
 }
 
+size_t ModemSubStreamDataRemaining = static_cast<size_t>(-1);
+
+void startModemSubStream(size_t octetsInSubStream)
+{
+    ModemSubStreamDataRemaining = octetsInSubStream;
+}
+
+void closeModemSubStream()
+{
+    if (ModemSubStreamDataRemaining == static_cast<size_t>(-1))
+    {
+        Serial.println(F("SMSForwarder: Closed modem substream without having started one before"));
+    }
+    else if (ModemSubStreamDataRemaining != 0)
+    {
+        Serial.print(F("SMSForwarder: Closed modem substream without reading all of its data ("));
+        Serial.print(ModemSubStreamDataRemaining);
+        Serial.println(F(" octets left in substream)"));
+    }
+
+    ModemSubStreamDataRemaining = static_cast<size_t>(-1);
+}
+
+int peekCharacterFromModem()
+{
+    if (ModemSubStreamDataRemaining == 0)
+    {
+        return ModemSerialState::EndOfStream;
+    }
+
+    return ModemSerial.peek();
+}
+
+void discardCharacterFromModem()
+{
+    if (ModemSubStreamDataRemaining == 0)
+    {
+        return;
+    }
+
+    int maybeCharacter = ModemSerial.read();
+
+    if (ModemSubStreamDataRemaining != static_cast<size_t>(-1) && maybeCharacter != ModemSerialState::NoData)
+    {
+        ModemSubStreamDataRemaining--;
+    }
+}
+
 void discardRead(Stream& stream)
 {
     while (stream.available())
@@ -370,16 +424,21 @@ bool readCharacterFromModem(char& character, char_predicate_t isCharacterToRead)
 {
     while (!isModemTimeout())
     {
-        int maybeCharacter = ModemSerial.peek();
+        int maybeCharacter = peekCharacterFromModem();
 
-        if (maybeCharacter >= 0)
+        if (maybeCharacter == ModemSerialState::EndOfStream)
+        {
+            return false;
+        }
+
+        if (maybeCharacter != ModemSerialState::NoData)
         {
             if (!isCharacterToRead(maybeCharacter))
             {
                 break;
             }
 
-            ModemSerial.read();
+            discardCharacterFromModem();
             character = static_cast<char>(maybeCharacter);
             return true;
         }
@@ -442,16 +501,21 @@ bool skipCharacterFromModem(char_predicate_t isCharacterToSkip)
 {
     while (!isModemTimeout())
     {
-        int maybeCharacter = ModemSerial.peek();
+        int maybeCharacter = peekCharacterFromModem();
 
-        if (maybeCharacter >= 0)
+        if (maybeCharacter == ModemSerialState::EndOfStream)
+        {
+            return false;
+        }
+
+        if (maybeCharacter != ModemSerialState::NoData)
         {
             if (!isCharacterToSkip(maybeCharacter))
             {
                 break;
             }
 
-            ModemSerial.read();
+            discardCharacterFromModem();
             return true;
         }
     }
