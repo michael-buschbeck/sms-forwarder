@@ -242,57 +242,6 @@ const Mapping<char, wchar_t> GSMToUnicodeExtension[] PROGMEM =
 
 SoftwareSerial ModemSerial(MODEM_SERIAL_RX_PIN, MODEM_SERIAL_TX_PIN);
 
-//|XXX ==============================================================================================================
-Stream* XXX_ModemSerialPtr = &ModemSerial;
-#define ModemSerial (*XXX_ModemSerialPtr)
-struct XXX_ModemSerialScope
-{
-    Stream* const oldModemSerialPtr;
-    XXX_ModemSerialScope(Stream& stream) : oldModemSerialPtr(XXX_ModemSerialPtr) { XXX_ModemSerialPtr = &stream; }
-    ~XXX_ModemSerialScope() { XXX_ModemSerialPtr = oldModemSerialPtr; }
-};
-
-//|XXX
-void XXX_printChar(int value)
-{
-    if (value < 0x10) { Serial.print(F("\\x0")); Serial.print(value, HEX); }
-    else if (value < 0x20) { Serial.print(F("\\x")); Serial.print(value, HEX); }
-    else { Serial.print((char)value); }
-}
-void XXX_printAndDiscardChar(Stream& stream)
-{
-    XXX_printChar(stream.read());
-}
-
-template<typename value_t>
-void XXX_printError(const __FlashStringHelper* prefix, value_t value)
-{
-    Serial.print(F("Error: "));
-    Serial.print(prefix);
-    Serial.print(F(" = 0x"));
-    Serial.println(value, HEX);
-}
-void XXX_printError(const __FlashStringHelper* message)
-{
-    Serial.print(F("Error: "));
-    Serial.println(message);
-}
-
-class FlashStringStream : public Stream
-{
-public:
-    FlashStringStream(const __FlashStringHelper* str)
-        : ptr(reinterpret_cast<PGM_P>(str)) {}
-
-    virtual int available() override { return pgm_read_byte(ptr) != 0; }
-    virtual int read() override { unsigned char data = pgm_read_byte(ptr); if (data == 0) { return -1; } else { ++ptr; return data; } };
-    virtual int peek() override { unsigned char data = pgm_read_byte(ptr); if (data == 0) { return -1; } else { return data; } };
-    virtual size_t write(uint8_t) override { return 0; }
-private:
-    PGM_P ptr;
-};
-//|XXX ==============================================================================================================
-
 constexpr uint16_t swapBytes(uint16_t value)
 {
     return (value >> 8) | (value << 8);
@@ -1664,9 +1613,6 @@ bool parseFileEntryFromModem(char* fileNameBuffer, size_t fileNameBufferSize, si
     return true;
 }
 
-//|XXX
-#undef ModemSerial
-
 void setup()
 {
     Serial.begin(57600);
@@ -1730,72 +1676,6 @@ void setup()
             delay(500);
         }
     }
-
-    //|XXX
-    if (true)
-    {
-        const char destination[] = "+491703104726";
-        size_t destinationLength = sizeof(destination) - 1;
-
-        const __FlashStringHelper* deliverPDUs[] =
-        {
-            F("0791947101670000040C9194713001746200005220421191954019C8329BFD06D1D1657939A49896C76F3719C44EBBCB21\r\n"),
-            F("0791947101670000040C919471300174620000522042119195405661BA0E0022BFD9ECB05C2700CDE73A0F681C9697E9BA0D05249687C7E5B96E83DAA440E2F078ADDBBC40627978BC2ED3E7BA0D6FE303D1D36C7259B7E981E0697859B70182CA75F95BB72903\r\n"),
-            F("0791021197003899440ED0657A7A1E6687E93408610192016390004205000365030106440642062F002006270633062A064706440643062A0020064306440020062706440648062D062F0627062A0020062706440645062C06270646064A\r\n"),
-            F("0791947101670000040C919471300174620008523030714172404600540065007300740020006D0069007400200041006B007A0065006E0074003A002000E100E0000A0055006D006C0061007500740065003A002000E400F600FC00C400D600DC\r\n"),
-        };
-
-        for (const __FlashStringHelper* deliverPDU : deliverPDUs)
-        {
-            startModemTimeout(300);
-            
-            FlashStringStream PDUStream(deliverPDU);
-
-            char sender[20+1];
-            uint8_t senderLength;
-
-            char message[160+1];
-            Encoding messageEncoding;
-            uint8_t messageLength;
-
-            bool parseSuccess;
-
-            {
-                XXX_ModemSerialScope PDUStreamScope(PDUStream);
-                parseSuccess = parseSMSPDUFromModem(sender, sizeof(sender), senderLength, message, sizeof(message), messageEncoding, messageLength);
-            }
-
-            if (parseSuccess)
-            {
-                Serial.print(F("Test: SMS sender: "));
-                printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
-                Serial.print(F("Test: SMS message (encoding "));
-                Serial.print(static_cast<uint8_t>(messageEncoding));
-                Serial.print(F("): "));
-                printlnEncoded(Serial, message, sizeof(message), messageEncoding);
-
-                size_t submitPDUSize = computeSMSPDUSize(destination, destinationLength, messageEncoding, messageLength);
-
-                if (submitPDUSize != 0)
-                {
-                    Serial.print(F("Test: Send PDU size: "));
-                    Serial.println(submitPDUSize);
-                    Serial.print(F("Test: Send PDU: "));
-
-                    {
-                        XXX_ModemSerialScope ConsoleScope(Serial);
-                        sendSMSPDUToModem(destination, destinationLength, message, messageEncoding, messageLength);
-                    }
-
-                    Serial.println();
-                }
-            }
-            else
-            {
-                Serial.println(F("Test: Failed to parse SMS PDU"));
-            }
-        }
-    }
 }
 
 void loop()
@@ -1828,17 +1708,6 @@ void loop()
             skipCharactersFromModemUntil('\r');
             skipEndOfLineFromModem();
 
-            /*
-            char line[2*163+1];
-
-            readCharactersFromModemUntil(line, sizeof(line), '\r');
-            discardLineFromModem();
-
-            Serial.print(F("GSM: SMS PDU: "));
-            Serial.println(line);
-
-            return;
-            /*/
             char sender[17+1];
             uint8_t senderLength;
 
@@ -1852,12 +1721,6 @@ void loop()
                 printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
                 Serial.print(F("GSM: SMS message: "));
                 printlnEncoded(Serial, message, sizeof(message), messageEncoding);
-
-                //|XXX
-                Serial.print(F("GSM: SMS message encoding: "));
-                Serial.println(static_cast<uint8_t>(messageEncoding));
-                Serial.print(F("GSM: SMS message length: "));
-                Serial.println(messageLength);
 
                 switch (messageEncoding)
                 {
@@ -1956,7 +1819,6 @@ void loop()
                 discardLineFromModem();
                 return;
             }
-            //*/
         }
 
         if (strcmp_P(resultCode, PSTR("CMGS")) == 0)
