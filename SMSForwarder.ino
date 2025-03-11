@@ -30,27 +30,61 @@ struct ModemSerialState
     enum : int { EndOfStream = -2 };
 };
 
-enum struct ModemResult : uint8_t
+enum struct ModemResult : int
 {
-    OK          = 0,
-    Connect     = 1,
-    Ring        = 2,
-    NoCarrier   = 3,
-    Error       = 4,
-    NoDialtone  = 6,
-    Busy        = 7,
-    NoAnswer    = 8,
-    Proceeding  = 9,
-    None        = 0xFF,
+    None = -1,
+
+    // Standard Hayes result codes
+    OK         = 0,
+    Connect    = 1,
+    Ring       = 2,
+    NoCarrier  = 3,
+    Error      = 4,
+    NoDialtone = 6,
+    Busy       = 7,
+    NoAnswer   = 8,
+    Proceeding = 9,
+
+    // Proprietary Quectel result codes
+    InvalidInputValue  = 3765,
+    NonExistentAddress = 3915,
+    UFSStorageFull     = 3916,
+    DriveFull          = 3917,
+    DriveError         = 3918,
+    FileNotFound1      = 3919,
+    InvalidFileName    = 3920,
+    FileAlreadyExisted = 3921,
+    FailedToCreateFile = 3922,
+    FailedToWriteFile  = 3923,
+    FailedToOpenFile   = 3924,
+    FailedToReadFile   = 3925,
+    ExceedMaxLength    = 4000,
+    OpenFileFail       = 4001,
+    WriteFileFail      = 4002,
+    GetSizeFail        = 4003,
+    ReadFail           = 4004,
+    ListFileFail       = 4005,
+    DeleteFileFail     = 4006,
+    GetDiskInfoFail    = 4007,
+    NoSpace            = 4008,
+    TimeOut            = 4009,
+    FileNotFound2      = 4010,
+    FileTooLarge       = 4011,
+    FileAlreadyExist   = 4012,
+    InvalidParameter   = 4013,
+    DriverError        = 4014,
+    CreateFail         = 4015,
+    AccessDenied       = 4016,
 };
 
 enum struct Encoding : uint8_t
 {
+    Unknown = 0xFF,
+
     UTF8     = 0,
     GSMBYTES = 1,
     UCS2LE   = 2,
     UCS2BE   = 3,
-    Unknown  = 0xFF,
 };
 
 const wchar_t GSMToUnicode[] PROGMEM =
@@ -357,28 +391,37 @@ void sendCommandToModem(const command_char_t* command, const arguments_t argumen
 
 ModemResult parseResultFromModem()
 {
-    char resultCode[2];
+    char resultCode[4+1];
 
     if (readDigitsFromModem(resultCode, sizeof(resultCode)) &&
         skipCharacterFromModem('\r'))
     {
-        return static_cast<ModemResult>(resultCode[0] - '0');
+        return static_cast<ModemResult>(atoi(resultCode));
     }
 
     return ModemResult::None;
 }
 
-size_t readDigitsFromModem(char* buffer, size_t bufferSize)
+bool isDecDigit(char character)
 {
-    return readCharactersFromModemWhile(buffer, bufferSize, [](char character) { return character >= '0' && character <= '9'; });
+    return (character >= '0' && character <= '9');
 }
 
-size_t readLineFromModem(char* buffer, size_t bufferSize, bool skipWhitespace = true, bool skipEndOfLine = true)
+size_t readDigitsFromModem(char* buffer, size_t bufferSize)
 {
-    if (skipWhitespace)
+    return readCharactersFromModemWhile(buffer, bufferSize, isDecDigit);
+}
+
+size_t skipDigitsFromModem()
+{
+    return skipCharactersFromModemWhile(isDecDigit);
+}
+
+size_t readLineFromModem(char* buffer, size_t bufferSize, bool skipHorizontalWhitespace = true, bool skipEndOfLine = true)
+{
+    if (skipHorizontalWhitespace)
     {
-        while (skipCharacterFromModem('\t') ||
-               skipCharacterFromModem(' '));
+        skipHorizontalWhitespaceFromModem();
     }
 
     size_t bufferLength = readCharactersFromModemUntil(buffer, bufferSize, '\r');
@@ -445,6 +488,12 @@ bool readCharacterFromModem(char& character, char_predicate_t isCharacterToRead)
     }
 
     return false;
+}
+
+void skipHorizontalWhitespaceFromModem()
+{
+    while (skipCharacterFromModem('\t') ||
+           skipCharacterFromModem(' '));
 }
 
 bool skipEndOfLineFromModem()
@@ -530,27 +579,22 @@ void discardLineFromModem()
     skipCharacterFromModem('\n');
 }
 
-void discardResponseFromModem()
+ModemResult discardResponseFromModem()
 {
     for (uint8_t numResponseLines = 2; numResponseLines != 0; --numResponseLines)
     {
-        char potentialResultCode[2+1];
+        char resultCode[4+1];
 
-        if (readCharactersFromModemUntil(potentialResultCode, sizeof(potentialResultCode), '\r') == 0)
+        if (readDigitsFromModem(resultCode, sizeof(resultCode)) &&
+            skipCharacterFromModem('\r'))
         {
-            return;
-        }
-
-        if (potentialResultCode[0] >= '0' &&
-            potentialResultCode[0] <= '9' &&
-            potentialResultCode[1] == '\0')
-        {
-            skipCharacterFromModem('\r');
-            return;
+            return static_cast<ModemResult>(atoi(resultCode));
         }
 
         discardLineFromModem();
     }
+
+    return ModemResult::None;
 }
 
 wchar_t lookupUnicodeForGSM(unsigned char character, bool isExtended)
@@ -1540,6 +1584,83 @@ bool sendSMSPDUToModem(const char* destination, size_t destinationLength, const 
 
     // Confirm sending
     ModemSerial.write(0x1A);
+    return true;
+}
+
+bool parseFileEntryFromModem(char* fileNameBuffer, size_t fileNameBufferSize, size_t* fileSize)
+{
+    if (fileNameBuffer != nullptr &&
+        fileNameBufferSize > 0)
+    {
+        fileNameBuffer[0] = '\0';
+    }
+
+    if (fileSize != nullptr)
+    {
+        *fileSize = 0;
+    }
+
+    if (!skipCharactersFromModem(F("+QFLST:")))
+    {
+        return false;
+    }
+
+    skipHorizontalWhitespaceFromModem();
+
+    // Read or skip file name in double quotes
+    {
+        if (!skipCharacterFromModem('"'))
+        {
+            return false;
+        }
+
+        if (fileNameBuffer == nullptr)
+        {
+            if (!skipCharactersFromModemUntil('"'))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            if (!readCharactersFromModemUntil(fileNameBuffer, fileNameBufferSize, '"'))
+            {
+                return false;
+            }
+        }
+
+        if (!skipCharacterFromModem('"') ||
+            !skipCharacterFromModem(','))
+        {
+            return false;
+        }
+    }
+
+    // Read or skip file size
+    {
+        if (fileSize == nullptr)
+        {
+            if (!skipDigitsFromModem())
+            {
+                return false;
+            }
+        }
+        else
+        {
+            char fileSizeBuffer[5+1];
+
+            if (!readDigitsFromModem(fileSizeBuffer, sizeof(fileSizeBuffer)))
+            {
+                return false;
+            }
+
+            *fileSize = atoi(fileSizeBuffer);
+        }
+    }
+
+    // Discard remaining line (optional RAM size) including end-of-line sequence
+    discardLineFromModem();
+
     return true;
 }
 
