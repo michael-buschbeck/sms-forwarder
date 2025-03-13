@@ -9,6 +9,7 @@
 // uno.build.extra_flags=-D_SS_MAX_RX_BUFF=128
 
 #include <Arduino.h>
+#include <EEPROM.h>
 #include <SoftwareSerial.h>
 
 #define MODEM_SERIAL_RX_PIN 2
@@ -17,17 +18,49 @@
 #define MODEM_RESET_PIN     6
 #define MODEM_POWER_PIN     7
 
-#define SIM_PIN "0000"
-
-const char* Destinations[] =
+struct EEPROMConfigSchema
 {
-    "+491701234567",
+    static constexpr unsigned long long ExpectedSchema =
+        static_cast<unsigned long long>('S')       |
+        static_cast<unsigned long long>('M') <<  8 |
+        static_cast<unsigned long long>('S') << 16 |
+        static_cast<unsigned long long>('F') << 24 |
+        static_cast<unsigned long long>('r') << 32 |
+        static_cast<unsigned long long>('w') << 40 |
+        static_cast<unsigned long long>('d') << 48 |
+        static_cast<unsigned long long>('r') << 56;
+
+    static constexpr unsigned int ExpectedVersion = 1;
+
+    // Stored configuration schema identifier and version
+    unsigned long long schema;
+    unsigned int version;
+
+    // Stored SIM PIN:
+    // Null-terminated string, may be empty
+    char SIMPIN[4+1] = {0};
+
+    // Number of stored forwarder destination phone numbers
+    static constexpr uint8_t NumDestinations = 3;
+
+    // Stored forwarder destination phone numbers:
+    // Null-terminated strings, each may be empty
+    char destinations[NumDestinations][17+1] = {0};
 };
+
+EEPROMConfigSchema EEPROMConfig;
 
 struct ModemSerialState
 {
     enum : int { NoData      = -1 };
     enum : int { EndOfStream = -2 };
+};
+
+enum struct ModemRuntimeState : uint8_t
+{
+    Uninitialized = 0,
+    Authorize = 1,
+    Active        = 2,
 };
 
 enum struct ModemResult : int
@@ -439,10 +472,15 @@ bool readCharacterFromModem(char& character, char_predicate_t isCharacterToRead)
     return false;
 }
 
+bool isHorizontalWhitespace(char character)
+{
+    return (character == '\t') ||
+           (character == ' ');
+}
+
 void skipHorizontalWhitespaceFromModem()
 {
-    while (skipCharacterFromModem('\t') ||
-           skipCharacterFromModem(' '));
+    skipCharactersFromModemWhile(isHorizontalWhitespace);
 }
 
 bool skipEndOfLineFromModem()
@@ -471,11 +509,11 @@ bool skipCharactersFromModemWhile(char_predicate_t isCharacterToSkip)
 
 bool skipCharactersFromModem(const __FlashStringHelper* charactersToSkip)
 {
-    PGM_P charactersToSkipPtr = reinterpret_cast<PGM_P>(charactersToSkip);
+    PGM_P characterToSkipPtr = reinterpret_cast<PGM_P>(charactersToSkip);
 
     while (true)
     {
-        char characterToSkip = pgm_read_byte(charactersToSkipPtr++);
+        char characterToSkip = pgm_read_byte(characterToSkipPtr++);
 
         if (characterToSkip == '\0')
         {
@@ -691,11 +729,11 @@ void printUnicode(Stream& stream, wchar_t codepoint)
 
 bool queryIMEI()
 {
-    char imei[16+1];
+    char IMEI[15+1];
 
     sendCommandToModem(F("AT+GSN"), 300);
 
-    if (readDigitsFromModem(imei, sizeof(imei)) &&
+    if (readDigitsFromModem(IMEI, sizeof(IMEI)) &&
         skipEndOfLineFromModem() &&
         parseResultFromModem() == ModemResult::OK)
     {
@@ -708,13 +746,12 @@ bool queryIMEI()
     }
 
     Serial.print(F("GSM: IMEI "));
-    Serial.print(imei);
+    Serial.print(IMEI);
     Serial.println();
     return true;
 }
 
-template<typename pin_char_t>
-bool enterSIMPIN(const pin_char_t* pin)
+bool enterSIMPIN(const char* pin)
 {
     char pinStatus[10+1];
 
@@ -746,14 +783,13 @@ bool enterSIMPIN(const pin_char_t* pin)
         return false;
     }
 
-    if (pin == nullptr)
+    if (pin == nullptr || pin[0] == '\0')
     {
         Serial.println(F("GSM: PIN required but not configured"));
         return false;
     }
     
-    Serial.print(F("GSM: PIN required, entering: "));
-    Serial.println(pin);
+    Serial.println(F("GSM: Entering PIN"));
 
     sendCommandToModem(F("AT+CPIN="), pin, 5000);
 
@@ -1613,12 +1649,197 @@ bool parseFileEntryFromModem(char* fileNameBuffer, size_t fileNameBufferSize, si
     return true;
 }
 
+void printSerialCommandHelp()
+{
+    Serial.println(F("SMSForwarder: Enter command via serial interface: list, add +491701234567, del +491701234567"));
+}
+
+void printSMSDestinations()
+{
+    for (uint8_t destinationIndex = 0; destinationIndex < EEPROMConfigSchema::NumDestinations; ++destinationIndex)
+    {
+        Serial.print(F("EEPROM: SMS destination "));
+        Serial.print(destinationIndex);
+
+        if (EEPROMConfig.destinations[destinationIndex][0] == '\0')
+        {
+            Serial.println(F(" not configured"));
+        }
+        else
+        {
+            Serial.print(F(" configured: "));
+            Serial.println(EEPROMConfig.destinations[destinationIndex]);
+        }
+    }
+}
+
+int findSMSDestination()
+{
+    for (uint8_t destinationIndex = 0; destinationIndex < EEPROMConfigSchema::NumDestinations; ++destinationIndex)
+    {
+        if (EEPROMConfig.destinations[destinationIndex][0] == '\0')
+        {
+            return destinationIndex;
+        }
+    }
+
+    return -1;
+}
+
+int findSMSDestination(const char* destination)
+{
+    for (uint8_t destinationIndex = 0; destinationIndex < EEPROMConfigSchema::NumDestinations; ++destinationIndex)
+    {
+        if (strcmp(EEPROMConfig.destinations[destinationIndex], destination) == 0)
+        {
+            return destinationIndex;
+        }
+    }
+
+    return -1;
+}
+
+bool skipCharacterInBuffer(const char*& characterPtr, char characterToSkip)
+{
+    if (*characterPtr == characterToSkip)
+    {
+        characterPtr++;
+        return true;
+    }
+
+    return false;
+}
+
+template<typename char_predicate_t>
+bool skipCharactersInBuffer(const char*& characterPtr, char_predicate_t isCharacterToSkip, size_t minCharactersToSkip, size_t maxCharactersToSkip)
+{
+    const char* characterToCheckPtr = characterPtr;
+    const char* characterToCheckPtrEnd = characterPtr + maxCharactersToSkip;
+
+    while (characterToCheckPtr < characterToCheckPtrEnd && isCharacterToSkip(*characterToCheckPtr))
+    {
+        characterToCheckPtr++;
+    }
+
+    if (characterToCheckPtr >= characterPtr + minCharactersToSkip)
+    {
+        characterPtr = characterToCheckPtr;
+        return true;
+    }
+
+    return false;
+}
+
+bool skipCharactersInBuffer(const char*& characterPtr, const __FlashStringHelper* charactersToSkip)
+{
+    const char* characterToCheckPtr = characterPtr;
+
+    PGM_P characterToSkipPtr = reinterpret_cast<PGM_P>(charactersToSkip);
+
+    while (true)
+    {
+        char characterToSkip = pgm_read_byte(characterToSkipPtr++);
+
+        if (characterToSkip == '\0')
+        {
+            characterPtr = characterToCheckPtr;
+            return true;
+        }
+
+        if (!skipCharacterInBuffer(characterToCheckPtr, characterToSkip))
+        {
+            return false;
+        }
+    }
+}
+
+bool isEndOfBuffer(const char* characterPtr)
+{
+    return *characterPtr == '\0';
+}
+
+bool isNonWordCharacterInBuffer(const char* characterPtr)
+{
+    char character = *characterPtr;
+
+    return (character != '_') &&
+           (character < '0' || character > '9') &&
+           (character < 'A' || character > 'Z') &&
+           (character < 'a' || character > 'z');
+}
+
 void setup()
 {
-    Serial.begin(57600);
-    ModemSerial.begin(9600);
+    delay(1000);
 
+    setupLED();
+    setupSerial();
+
+    Serial.println(F("SMSForwarder startup"));
+
+    setupEEPROM();
+    setupModem();
+}
+
+void setupLED()
+{
+    pinMode(LED_BUILTIN, OUTPUT);
+    digitalWrite(LED_BUILTIN, LOW);
+}
+
+void setupSerial()
+{
+    Serial.begin(57600);
     discardRead(Serial);
+}
+
+void setupEEPROM()
+{
+    EEPROM.get(0, EEPROMConfig);
+
+    if (EEPROMConfig.schema == EEPROMConfigSchema::ExpectedSchema &&
+        EEPROMConfig.version == EEPROMConfigSchema::ExpectedVersion)
+    {
+        Serial.println(F("EEPROM: Loaded configuration"));
+    }
+    else
+    {
+        if (EEPROMConfig.schema != EEPROMConfigSchema::ExpectedSchema)
+        {
+            Serial.println(F("EEPROM: Unable to load configuration (unknown schema)"));
+        }
+        else if (EEPROMConfig.version != EEPROMConfigSchema::ExpectedVersion)
+        {
+            Serial.print(F("EEPROM: Unable to load configuration (unknown version: expected "));
+            Serial.print(EEPROMConfigSchema::ExpectedVersion);
+            Serial.print(F(", loaded "));
+            Serial.print(EEPROMConfig.version);
+            Serial.println(F(")"));
+        }
+
+        memset(&EEPROMConfig, 0, sizeof(EEPROMConfig));
+
+        EEPROMConfig.schema = EEPROMConfigSchema::ExpectedSchema;
+        EEPROMConfig.version = EEPROMConfigSchema::ExpectedVersion;
+    }
+
+    if (EEPROMConfig.SIMPIN[0] == '\0')
+    {
+        Serial.println(F("EEPROM: SIM PIN not configured"));
+    }
+    else
+    {
+        Serial.println(F("EEPROM: SIM PIN configured"));
+    }
+
+    printSMSDestinations();
+}
+
+ModemRuntimeState ModemState = ModemRuntimeState::Uninitialized;
+
+void setupModem()
+{
+    ModemSerial.begin(9600);
     discardRead(ModemSerial);
 
     pinMode(MODEM_RESET_PIN, OUTPUT);
@@ -1627,14 +1848,8 @@ void setup()
     digitalWrite(MODEM_POWER_PIN, HIGH);
     pinMode(MODEM_STATUS_PIN, INPUT);
 
-    delay(100);
-
-    Serial.flush();
-    ModemSerial.flush();
-
     delay(1000);
 
-    Serial.println(F("SMSForwarder startup"));
     Serial.println(F("GSM: Powering on"));
 
     delay(100);
@@ -1659,40 +1874,237 @@ void setup()
     }
 
     if (queryIMEI() &&
-        enterSIMPIN(F(SIM_PIN)) &&
         setupReceiveSMS())
     {
-        Serial.println(F("SMSForwarder startup successful"));
+        ModemState = ModemRuntimeState::Authorize;
     }
-    else
-    {
-        Serial.println(F("SMSForwarder startup failed"));
 
-        while (true)
-        {
-            digitalWrite(LED_BUILTIN, HIGH);
-            delay(500);
-            digitalWrite(LED_BUILTIN, LOW);
-            delay(500);
-        }
+    if (ModemState == ModemRuntimeState::Authorize &&
+        enterSIMPIN(EEPROMConfig.SIMPIN))
+    {
+        ModemState = ModemRuntimeState::Active;
+    }
+
+    switch (ModemState)
+    {
+        case ModemRuntimeState::Uninitialized:
+            Serial.println(F("GSM: Startup failed"));
+            break;
+        
+        case ModemRuntimeState::Authorize:
+            Serial.println(F("GSM: Enter SIM PIN via serial interface to complete startup"));
+            break;
+
+        case ModemRuntimeState::Active:
+            Serial.println(F("GSM: Startup complete"));
+            printSerialCommandHelp();
+            break;
     }
 }
 
 void loop()
 {
-    int character = ModemSerial.read();
+    if (loopModem())
+    {
+        printSerialCommandHelp();
+    }
 
-    if (character < 0)
+    loopSerial();
+}
+
+char SerialCommandBuffer[32+1];
+uint8_t SerialCommandLength = 0;
+
+void loopSerial()
+{
+    int maybeCharacter = Serial.read();
+
+    if (maybeCharacter < 0)
     {
         return;
     }
 
+    char character = static_cast<char>(maybeCharacter);
+
+    if (isHorizontalWhitespace(character) && (SerialCommandLength == 0 || isHorizontalWhitespace(SerialCommandBuffer[SerialCommandLength - 1])))
+    {
+        return;
+    }
+
+    if (character == '\r' ||
+        character == '\n')
+    {
+        if (SerialCommandLength == 0)
+        {
+            return;
+        }
+
+        if (isHorizontalWhitespace(SerialCommandBuffer[SerialCommandLength - 1]))
+        {
+            SerialCommandLength--;
+        }
+
+        if (SerialCommandLength > 0)
+        {
+            SerialCommandBuffer[SerialCommandLength] = '\0';
+            
+            Serial.print(F("SMSForwarder: Entered command: "));
+            Serial.println(SerialCommandBuffer);
+
+            switch (ModemState)
+            {
+                case ModemRuntimeState::Uninitialized:
+                {
+                    Serial.println(F("SMSForwarder: Startup failed, no commands accepted"));
+                }
+                break;
+
+                case ModemRuntimeState::Authorize:
+                {
+                    const char* serialCommandCharacterPtr = SerialCommandBuffer;
+
+                    if (skipCharactersInBuffer(serialCommandCharacterPtr, isDecDigit, 4, 4) &&
+                        isEndOfBuffer(serialCommandCharacterPtr))
+                    {
+                        if (enterSIMPIN(SerialCommandBuffer))
+                        {
+                            strcpy(EEPROMConfig.SIMPIN, SerialCommandBuffer);
+                            EEPROM.put(0, EEPROMConfig);
+
+                            Serial.println("EEPROM: Updated configured SIM PIN");
+
+                            ModemState = ModemRuntimeState::Active;
+                        }
+                    }
+                    else
+                    {
+                        Serial.println(F("SMSForwarder: Invalid format for SIM PIN (expected four decimal digits)"));
+                    }
+
+                }
+                break;
+
+                case ModemRuntimeState::Active:
+                {
+                    const char* serialCommandCharacterPtr = SerialCommandBuffer;
+
+                    if (skipCharactersInBuffer(serialCommandCharacterPtr, F("list")) &&
+                        isEndOfBuffer(serialCommandCharacterPtr))
+                    {
+                        printSMSDestinations();
+                        break;
+                    }
+
+                    if (skipCharactersInBuffer(serialCommandCharacterPtr, F("add")) &&
+                        isNonWordCharacterInBuffer(serialCommandCharacterPtr))
+                    {
+                        skipCharactersInBuffer(serialCommandCharacterPtr, isHorizontalWhitespace, 1, 1);
+
+                        const char* destinationPtr = serialCommandCharacterPtr;
+
+                        if (skipCharacterInBuffer(serialCommandCharacterPtr, '+') &&
+                            skipCharactersInBuffer(serialCommandCharacterPtr, isDecDigit, 7, 17) &&
+                            isEndOfBuffer(serialCommandCharacterPtr))
+                        {
+                            int destinationIndex = findSMSDestination(destinationPtr);
+
+                            if (destinationIndex >= 0)
+                            {
+                                Serial.print(F("SMSForwarder: Destination phone number already configured in slot "));
+                                Serial.println(destinationIndex);
+                                printSMSDestinations();
+                                break;
+                            }
+
+                            int emptyDestinationIndex = findSMSDestination();
+
+                            if (emptyDestinationIndex < 0)
+                            {
+                                Serial.println(F("SMSForwarder: No empty slot for new destination phone number"));
+                                printSMSDestinations();
+                                break;
+                            }
+
+                            memset(EEPROMConfig.destinations[emptyDestinationIndex], 0, sizeof(EEPROMConfig.destinations[emptyDestinationIndex]));
+                            strcpy(EEPROMConfig.destinations[emptyDestinationIndex], destinationPtr);
+
+                            EEPROM.put(0, EEPROMConfig);
+
+                            Serial.print(F("SMSForwarder: Configured destination phone number in slot "));
+                            Serial.println(emptyDestinationIndex);
+                            printSMSDestinations();
+                            break;
+                        }
+                        else
+                        {
+                            Serial.println(F("SMSForwarder: Invalid destination phone number (expected international phone number format)"));
+                            break;
+                        }
+                    }
+
+                    if (skipCharactersInBuffer(serialCommandCharacterPtr, F("del")) &&
+                        isNonWordCharacterInBuffer(serialCommandCharacterPtr))
+                    {
+                        skipCharactersInBuffer(serialCommandCharacterPtr, isHorizontalWhitespace, 1, 1);
+
+                        const char* destinationPtr = serialCommandCharacterPtr;
+
+                        int destinationIndex = findSMSDestination(destinationPtr);
+
+                        if (destinationIndex < 0)
+                        {
+                            Serial.println(F("SMSForwarder: Destination phone number not configured"));
+                            printSMSDestinations();
+                            break;
+                        }
+
+                        memset(EEPROMConfig.destinations[destinationIndex], 0, sizeof(EEPROMConfig.destinations[destinationIndex]));
+
+                        EEPROM.put(0, EEPROMConfig);
+
+                        Serial.print(F("SMSForwarder: Deleted destination phone number from slot "));
+                        Serial.println(destinationIndex);
+                        printSMSDestinations();
+                        break;
+                    }
+
+                    Serial.println(F("SMSForwarder: Unknown command"));
+                }
+                break;
+            }
+
+            SerialCommandLength = 0;
+        }
+
+        return;
+    }
+
+    if (SerialCommandLength < sizeof(SerialCommandBuffer) - 1)
+    {
+        SerialCommandBuffer[SerialCommandLength++] = character;
+    }
+}
+
+bool loopModem()
+{
+    if (ModemState != ModemRuntimeState::Active)
+    {
+        return false;
+    }
+
+    int maybeCharacter = ModemSerial.read();
+
+    if (maybeCharacter < 0)
+    {
+        return false;
+    }
+
     startModemTimeout(1000);
 
-    if (character != '+')
+    if (maybeCharacter != '+')
     {
         discardLineFromModem();
-        return;
+        return false;
     }
 
     char resultCode[9+1];
@@ -1793,8 +2205,13 @@ void loop()
                 Serial.print(F("SMSForwarder: Outgoing SMS message: "));
                 printlnEncoded(Serial, message, sizeof(message), messageEncoding);
 
-                for (const char* destination : Destinations)
+                for (const char* destination : EEPROMConfig.destinations)
                 {
+                    if (destination[0] == '\0')
+                    {
+                        continue;
+                    }
+
                     Serial.print(F("SMSForwarder: Forwarding to "));
                     Serial.println(destination);
 
@@ -1812,12 +2229,12 @@ void loop()
                     }
                 }
 
-                return;
+                return true;
             }
             else
             {
                 discardLineFromModem();
-                return;
+                return true;
             }
         }
 
@@ -1832,7 +2249,7 @@ void loop()
             }
 
             discardResponseFromModem();
-            return;
+            return true;
         }
 
         if (strcmp_P(resultCode, PSTR("CMS ERROR")) == 0)
@@ -1850,13 +2267,14 @@ void loop()
             }
 
             discardResponseFromModem();
-            return;
+            return true;
         }
 
         Serial.print(F("GSM: Unknown result code: "));
         Serial.println(resultCode);
-        return;
+        return true;
     }
 
     discardLineFromModem();
+    return false;
 }
