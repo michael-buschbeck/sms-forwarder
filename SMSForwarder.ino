@@ -327,7 +327,7 @@ int peekCharacterFromModem()
     return ModemSerial.peek();
 }
 
-void discardCharacterFromModem()
+void discardCharacterFromModem(bool echo = false)
 {
     if (ModemSubStreamDataRemaining == 0)
     {
@@ -339,6 +339,19 @@ void discardCharacterFromModem()
     if (ModemSubStreamDataRemaining != static_cast<size_t>(-1) && maybeCharacter != ModemSerialState::NoData)
     {
         ModemSubStreamDataRemaining--;
+    }
+
+    if (echo && maybeCharacter > 0)
+    {
+        if (maybeCharacter >= 0x20)
+        {
+            Serial.write(maybeCharacter);
+        }
+        else
+        {
+            Serial.print(F("\\x"));
+            Serial.print(maybeCharacter, HEX);
+        }
     }
 }
 
@@ -352,96 +365,74 @@ void discardRead(Stream& stream)
     delay(100);
 }
 
-template<typename command_char_t>
-void sendCommandToModem(const command_char_t* command, unsigned long responseTimeout)
+template<typename char_predicate_t>
+bool skipCharacterFromModem(char_predicate_t isCharacterToSkip, bool echo = false)
 {
-    ModemSerial.print(command);
-    ModemSerial.print('\r');
-
-    startModemTimeout(responseTimeout);
-}
-
-template<typename command_char_t, typename arguments_t>
-void sendCommandToModem(const command_char_t* command, const arguments_t arguments, unsigned long responseTimeout)
-{
-    ModemSerial.print(command);
-    ModemSerial.print(arguments);
-    ModemSerial.print('\r');
-
-    startModemTimeout(responseTimeout);
-}
-
-ModemResult parseResultFromModem()
-{
-    char resultCode[4+1];
-
-    if (readDigitsFromModem(resultCode, sizeof(resultCode)) &&
-        skipCharacterFromModem('\r'))
+    while (!isModemTimeout())
     {
-        return static_cast<ModemResult>(atoi(resultCode));
+        int maybeCharacter = peekCharacterFromModem();
+
+        if (maybeCharacter == ModemSerialState::EndOfStream)
+        {
+            return false;
+        }
+
+        if (maybeCharacter != ModemSerialState::NoData)
+        {
+            if (!isCharacterToSkip(maybeCharacter))
+            {
+                break;
+            }
+
+            discardCharacterFromModem(echo);
+            return true;
+        }
     }
 
-    return ModemResult::None;
+    return false;
 }
 
-bool isDecDigit(char character)
+bool skipCharacterFromModem(char characterToSkip, bool echo = false)
 {
-    return (character >= '0' && character <= '9');
+    return skipCharacterFromModem([characterToSkip](char character) { return character == characterToSkip; }, echo);
 }
 
-size_t readDigitsFromModem(char* buffer, size_t bufferSize)
+bool skipCharactersFromModem(const __FlashStringHelper* charactersToSkip)
 {
-    return readCharactersFromModemWhile(buffer, bufferSize, isDecDigit);
-}
+    PGM_P characterToSkipPtr = reinterpret_cast<PGM_P>(charactersToSkip);
 
-size_t skipDigitsFromModem()
-{
-    return skipCharactersFromModemWhile(isDecDigit);
-}
-
-size_t readLineFromModem(char* buffer, size_t bufferSize, bool skipHorizontalWhitespace = true, bool skipEndOfLine = true)
-{
-    if (skipHorizontalWhitespace)
+    while (true)
     {
-        skipHorizontalWhitespaceFromModem();
+        char characterToSkip = pgm_read_byte(characterToSkipPtr++);
+
+        if (characterToSkip == '\0')
+        {
+            return true;
+        }
+
+        if (!skipCharacterFromModem(characterToSkip))
+        {
+            return false;
+        }
     }
-
-    size_t bufferLength = readCharactersFromModemUntil(buffer, bufferSize, '\r');
-
-    if (skipEndOfLine)
-    {
-        skipCharacterFromModem('\r');
-        skipCharacterFromModem('\n');
-    }
-
-    return bufferLength;
-}
-
-size_t readCharactersFromModemUntil(char* buffer, size_t bufferSize, char stopCharacter)
-{
-    return readCharactersFromModemWhile(buffer, bufferSize, [stopCharacter](char character) { return character != stopCharacter; });
 }
 
 template<typename char_predicate_t>
-size_t readCharactersFromModemWhile(char* buffer, size_t bufferSize, char_predicate_t isCharacterToRead)
+bool skipCharactersFromModemWhile(char_predicate_t isCharacterToSkip, bool echo = false)
 {
-    char* characterPtr = buffer;
-    char* characterPtrEnd = buffer + bufferSize - 1;
+    bool skipped = false;
 
-    while (characterPtr < characterPtrEnd)
+    while (skipCharacterFromModem(isCharacterToSkip, echo))
     {
-        if (readCharacterFromModem(*characterPtr, isCharacterToRead))
-        {
-            characterPtr++;
-            continue;
-        }
-
-        break;
+        skipped = true;
     }
 
-    *characterPtr = '\0';
+    return skipped;
+}
 
-    return static_cast<size_t>(characterPtr - buffer);
+bool skipCharactersFromModemUntil(char stopCharacter, bool echo = false)
+{
+    return skipCharactersFromModemWhile([stopCharacter](char character) { return character != stopCharacter; }, echo);
 }
 
 template<typename char_predicate_t>
@@ -472,6 +463,66 @@ bool readCharacterFromModem(char& character, char_predicate_t isCharacterToRead)
     return false;
 }
 
+template<typename char_predicate_t>
+size_t readCharactersFromModemWhile(char* buffer, size_t bufferSize, char_predicate_t isCharacterToRead)
+{
+    char* characterPtr = buffer;
+    char* characterPtrEnd = buffer + bufferSize - 1;
+
+    while (characterPtr < characterPtrEnd)
+    {
+        if (readCharacterFromModem(*characterPtr, isCharacterToRead))
+        {
+            characterPtr++;
+            continue;
+        }
+
+        break;
+    }
+
+    *characterPtr = '\0';
+
+    return static_cast<size_t>(characterPtr - buffer);
+}
+
+size_t readCharactersFromModemUntil(char* buffer, size_t bufferSize, char stopCharacter)
+{
+    return readCharactersFromModemWhile(buffer, bufferSize, [stopCharacter](char character) { return character != stopCharacter; });
+}
+
+size_t readLineFromModem(char* buffer, size_t bufferSize, bool skipHorizontalWhitespace = true, bool skipEndOfLine = true)
+{
+    if (skipHorizontalWhitespace)
+    {
+        skipHorizontalWhitespaceFromModem();
+    }
+
+    size_t bufferLength = readCharactersFromModemUntil(buffer, bufferSize, '\r');
+
+    if (skipEndOfLine)
+    {
+        skipCharacterFromModem('\r');
+        skipCharacterFromModem('\n');
+    }
+
+    return bufferLength;
+}
+
+bool isDecDigit(char character)
+{
+    return (character >= '0' && character <= '9');
+}
+
+size_t skipDigitsFromModem()
+{
+    return skipCharactersFromModemWhile(isDecDigit);
+}
+
+size_t readDigitsFromModem(char* buffer, size_t bufferSize)
+{
+    return readCharactersFromModemWhile(buffer, bufferSize, isDecDigit);
+}
+
 bool isHorizontalWhitespace(char character)
 {
     return (character == '\t') ||
@@ -489,99 +540,17 @@ bool skipEndOfLineFromModem()
            skipCharacterFromModem('\n');
 }
 
-bool skipCharactersFromModemUntil(char stopCharacter)
+void discardLineFromModem(bool echo = false)
 {
-    return skipCharactersFromModemWhile([stopCharacter](char character) { return character != stopCharacter; });
-}
+    skipCharactersFromModemUntil('\r', echo);
 
-template<typename char_predicate_t>
-bool skipCharactersFromModemWhile(char_predicate_t isCharacterToSkip)
-{
-    bool skipped = false;
-
-    while (skipCharacterFromModem(isCharacterToSkip))
+    if (echo)
     {
-        skipped = true;
+        Serial.println();
     }
 
-    return skipped;
-}
-
-bool skipCharactersFromModem(const __FlashStringHelper* charactersToSkip)
-{
-    PGM_P characterToSkipPtr = reinterpret_cast<PGM_P>(charactersToSkip);
-
-    while (true)
-    {
-        char characterToSkip = pgm_read_byte(characterToSkipPtr++);
-
-        if (characterToSkip == '\0')
-        {
-            return true;
-        }
-
-        if (!skipCharacterFromModem(characterToSkip))
-        {
-            return false;
-        }
-    }
-}
-
-bool skipCharacterFromModem(char characterToSkip)
-{
-    return skipCharacterFromModem([characterToSkip](char character) { return character == characterToSkip; });
-}
-
-template<typename char_predicate_t>
-bool skipCharacterFromModem(char_predicate_t isCharacterToSkip)
-{
-    while (!isModemTimeout())
-    {
-        int maybeCharacter = peekCharacterFromModem();
-
-        if (maybeCharacter == ModemSerialState::EndOfStream)
-        {
-            return false;
-        }
-
-        if (maybeCharacter != ModemSerialState::NoData)
-        {
-            if (!isCharacterToSkip(maybeCharacter))
-            {
-                break;
-            }
-
-            discardCharacterFromModem();
-            return true;
-        }
-    }
-
-    return false;
-}
-
-void discardLineFromModem()
-{
-    skipCharactersFromModemUntil('\r');
     skipCharacterFromModem('\r');
     skipCharacterFromModem('\n');
-}
-
-ModemResult discardResponseFromModem()
-{
-    for (uint8_t numResponseLines = 2; numResponseLines != 0; --numResponseLines)
-    {
-        char resultCode[4+1];
-
-        if (readDigitsFromModem(resultCode, sizeof(resultCode)) &&
-            skipCharacterFromModem('\r'))
-        {
-            return static_cast<ModemResult>(atoi(resultCode));
-        }
-
-        discardLineFromModem();
-    }
-
-    return ModemResult::None;
 }
 
 wchar_t lookupUnicodeForGSM(unsigned char character, bool isExtended)
@@ -727,6 +696,116 @@ void printUnicode(Stream& stream, wchar_t codepoint)
     }
 }
 
+bool isHexDigit(char character)
+{
+    return (character >= '0' && character <= '9') ||
+           (character >= 'A' && character <= 'F') ||
+           (character >= 'a' && character <= 'f');
+}
+
+uint8_t parseHexFromModem(uint8_t resultOnError = 0xFF)
+{
+    uint8_t result = 0;
+
+    for (uint8_t numHexDigits = 2; numHexDigits > 0; --numHexDigits)
+    {
+        char hexDigit;
+
+        if (readCharacterFromModem(hexDigit, isHexDigit))
+        {
+            // 0..9: 00110000..00111001 (digit & 0x0F)
+            // A..F: 01000001..01000110 (digit & 0x0F + 9)
+            // a..f: 01100001..01100110 (digit & 0x0F + 9)
+            result <<= 4;
+            result |= (hexDigit < 'A') ? (hexDigit & 0x0F) : (hexDigit & 0x0F) + 9;
+
+            continue;
+        }
+
+        return resultOnError;
+    }
+
+    return result;
+}
+
+bool skipHexFromModem(size_t numHexDigits)
+{
+    for (; numHexDigits > 0; --numHexDigits)
+    {
+        if (!skipCharacterFromModem(isHexDigit))
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void sendHexToModem(uint8_t value)
+{
+    for (uint8_t numHexDigits = 2; numHexDigits > 0; --numHexDigits)
+    {
+        char hexDigit;
+        
+        hexDigit = value >> 4;
+        hexDigit += (hexDigit < 10) ? '0' : ('A' - 10);
+
+        ModemSerial.write(hexDigit);
+
+        value <<= 4;
+    }
+}
+
+template<typename command_char_t>
+void sendCommandToModem(const command_char_t* command, unsigned long responseTimeout)
+{
+    ModemSerial.print(command);
+    ModemSerial.print('\r');
+
+    startModemTimeout(responseTimeout);
+}
+
+template<typename command_char_t, typename arguments_t>
+void sendCommandToModem(const command_char_t* command, const arguments_t arguments, unsigned long responseTimeout)
+{
+    ModemSerial.print(command);
+    ModemSerial.print(arguments);
+    ModemSerial.print('\r');
+
+    startModemTimeout(responseTimeout);
+}
+
+ModemResult parseResultFromModem()
+{
+    char resultCode[4+1];
+
+    if (readDigitsFromModem(resultCode, sizeof(resultCode)) &&
+        skipCharacterFromModem('\r'))
+    {
+        return static_cast<ModemResult>(atoi(resultCode));
+    }
+
+    return ModemResult::None;
+}
+
+ModemResult discardResponseFromModem()
+{
+    for (uint8_t numResponseLines = 2; numResponseLines != 0; --numResponseLines)
+    {
+        char resultCode[4+1];
+
+        if (readDigitsFromModem(resultCode, sizeof(resultCode)) &&
+            skipCharacterFromModem('\r'))
+        {
+            return static_cast<ModemResult>(atoi(resultCode));
+        }
+
+        discardLineFromModem();
+    }
+
+    return ModemResult::None;
+}
+
 bool queryIMEI()
 {
     char IMEI[15+1];
@@ -837,66 +916,6 @@ bool setupReceiveSMS()
     }
 
     return true;
-}
-
-bool isHexDigit(char character)
-{
-    return (character >= '0' && character <= '9') ||
-           (character >= 'A' && character <= 'F') ||
-           (character >= 'a' && character <= 'f');
-}
-
-uint8_t parseHexFromModem(uint8_t resultOnError = 0xFF)
-{
-    uint8_t result = 0;
-
-    for (uint8_t numHexDigits = 2; numHexDigits > 0; --numHexDigits)
-    {
-        char hexDigit;
-
-        if (readCharacterFromModem(hexDigit, isHexDigit))
-        {
-            // 0..9: 00110000..00111001 (digit & 0x0F)
-            // A..F: 01000001..01000110 (digit & 0x0F + 9)
-            // a..f: 01100001..01100110 (digit & 0x0F + 9)
-            result <<= 4;
-            result |= (hexDigit < 'A') ? (hexDigit & 0x0F) : (hexDigit & 0x0F) + 9;
-
-            continue;
-        }
-
-        return resultOnError;
-    }
-
-    return result;
-}
-
-bool skipHexFromModem(size_t numHexDigits)
-{
-    for (; numHexDigits > 0; --numHexDigits)
-    {
-        if (!skipCharacterFromModem(isHexDigit))
-        {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-void sendHexToModem(uint8_t value)
-{
-    for (uint8_t numHexDigits = 2; numHexDigits > 0; --numHexDigits)
-    {
-        char hexDigit;
-        
-        hexDigit = value >> 4;
-        hexDigit += (hexDigit < 10) ? '0' : ('A' - 10);
-
-        ModemSerial.write(hexDigit);
-
-        value <<= 4;
-    }
 }
 
 uint8_t parseGSMAlphaFromModem(char* characterBuffer, size_t characterBufferSize, uint8_t charactersToParse)
@@ -1651,7 +1670,7 @@ bool parseFileEntryFromModem(char* fileNameBuffer, size_t fileNameBufferSize, si
 
 void printSerialCommandHelp()
 {
-    Serial.println(F("SMSForwarder: Enter command via serial interface: list, add +491701234567, del +491701234567"));
+    Serial.println(F("SMSForwarder: Enter command via serial interface: list, add +491701234567, del +491701234567, voice +491701234567"));
 }
 
 void executeSerialCommandAdd(const char* argumentsPtr)
@@ -1856,7 +1875,13 @@ void forwardSMS(const char* sender, size_t senderLength, char* messageBuffer, si
 
         if (submitPDUSize > 0)
         {
-            sendCommandToModem(F("AT+CMGS="), submitPDUSize, 120000);
+            sendCommandToModem(F("AT+CMGS="), submitPDUSize, 10000);
+
+            skipEndOfLineFromModem();
+            skipEndOfLineFromModem();
+            skipCharacterFromModem('>');
+            skipCharacterFromModem(' ');
+
             sendSMSPDUToModem(destination, destinationLength, messageBuffer, messageEncoding, messageLength);
         }
         else
@@ -2178,6 +2203,14 @@ void loopSerial()
                         break;
                     }
 
+                    if (skipCharactersInBuffer(serialCommandCharacterPtr, F("AT")))
+                    {
+                        Serial.print(F("GSM: "));
+                        Serial.println(SerialCommandBuffer);
+                        sendCommandToModem(SerialCommandBuffer, 1000);
+                        break;
+                    }
+
                     Serial.println(F("SMSForwarder: Unknown command"));
                 }
                 break;
@@ -2213,7 +2246,10 @@ bool loopModem()
 
     if (maybeCharacter != '+')
     {
-        discardLineFromModem();
+        Serial.print(F("GSM: "));
+        Serial.write(maybeCharacter);
+        discardLineFromModem(true);
+
         return false;
     }
 
@@ -2286,11 +2322,14 @@ bool loopModem()
             return true;
         }
 
-        Serial.print(F("GSM: Unknown result code: "));
-        Serial.println(resultCode);
+        Serial.print(F("GSM: +"));
+        Serial.print(resultCode);
+        Serial.print(F(":"));
+        discardLineFromModem(true);
         return true;
     }
 
-    discardLineFromModem();
+    Serial.print(F("GSM: +"));
+    discardLineFromModem(true);
     return false;
 }
