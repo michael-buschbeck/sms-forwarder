@@ -1253,6 +1253,17 @@ void sendCommandToModem(const command_char_t* command, const arguments_t argumen
     startModemTimeout(responseTimeout);
 }
 
+template<typename command_char_t, typename argument1_t, typename argument2_t>
+void sendCommandToModem(const command_char_t* command, const argument1_t argument1, const argument2_t argument2, unsigned long responseTimeout)
+{
+    ModemSerial.print(command);
+    ModemSerial.print(argument1);
+    ModemSerial.print(argument2);
+    ModemSerial.print('\r');
+
+    startModemTimeout(responseTimeout);
+}
+
 ModemResult parseResultFromModem()
 {
     char resultCode[4+1];
@@ -1413,6 +1424,208 @@ bool setupReceiveSMS()
     }
 
     return true;
+}
+
+void queryCallForwardingAsync(void (*callback)(ModemResult modemResult, const char* forwardingNumber))
+{
+    struct QueryCallForwardingModemCommand : ModemCommand
+    {
+        void (*callback)(ModemResult modemResult, const char* forwardingNumber);
+
+        virtual bool sendCommand() override
+        {
+            // Query call forwarding
+            //   <reads>=0: unconditional forwarding
+            //   <mode>=2: query
+            //   <number>
+            //   <type>
+            //   <class>=1: voice calls
+            sendCommandToModem(F("AT+CCFC=0,2,,,1"), 10000);
+            
+            return true;
+        }
+
+        virtual bool tryProcessResponse() override
+        {
+            bool gotForwardingNumber = false;
+
+            char forwardingNumber[17+1];
+
+            while (true)
+            {
+                markReadFromModemRollback();
+
+                char forwardingStatus[1+1];
+                char forwardingClass[2+1];
+
+                if (skipCharactersFromModem(F("+CCFC:")) &&
+                    readDigitsFromModem(forwardingStatus, sizeof(forwardingStatus)) &&
+                    skipCharacterFromModem(',') &&
+                    readDigitsFromModem(forwardingClass, sizeof(forwardingClass)))
+                {
+                    releaseReadFromModemRollback();
+
+                    // Read forwarding number if enabled for voice calls
+                    if (forwardingStatus[0] == '1' &&
+                        forwardingClass[0] == '1' &&
+                        skipCharacterFromModem(',') &&
+                        skipCharacterFromModem('"') &&
+                        readCharactersFromModemUntil(forwardingNumber, sizeof(forwardingNumber), '"') &&
+                        skipCharacterFromModem('"'))
+                    {
+                        gotForwardingNumber = true;
+                    }
+
+                    // Skip remaining fields including end-of-line
+                    discardLineFromModem();
+                }
+                else
+                {
+                    // Roll back to start of line to parse result
+                    seekReadFromModemRollback();
+
+                    break;
+                }
+            }
+
+            ModemResult modemResult = parseResultFromModem();
+
+            if (modemResult == ModemResult::None)
+            {
+                return false;
+            }
+
+            if (callback != nullptr)
+            {
+                callback(modemResult, gotForwardingNumber ? forwardingNumber : nullptr);
+            }
+
+            return true;
+        }
+    };
+
+    QueryCallForwardingModemCommand* modemCommand = enqueueModemCommand<QueryCallForwardingModemCommand>();
+
+    if (modemCommand == nullptr)
+    {
+        Serial.println(F("SMSForwarder: Cannot query voice call forwarding (modem command queue full)"));
+        return;
+    }
+
+    modemCommand->callback = callback;
+    modemCommand->state = ModemCommandState::ReadyToSendCommand;
+}
+
+void disableCallForwardingAsync(void (*callback)(ModemResult modemResult))
+{
+    struct DisableCallForwardingModemCommand : ModemCommand
+    {
+        void (*callback)(ModemResult modemResult);
+
+        virtual bool sendCommand() override
+        {
+            // Disable call forwarding
+            //   <reads>=0: unconditional forwarding
+            //   <mode>=4: erasure
+            //   <number>
+            //   <type>
+            //   <class>=1: voice calls
+            sendCommandToModem(F("AT+CCFC=0,4,,,1"), 10000);
+
+            return true;
+        }
+
+        virtual bool tryProcessResponse() override
+        {
+            ModemResult modemResult = parseResultFromModem();
+
+            if (modemResult == ModemResult::None)
+            {
+                return false;
+            }
+
+            if (callback != nullptr)
+            {
+                callback(modemResult);
+            }
+
+            return true;
+        }
+    };
+
+    DisableCallForwardingModemCommand* modemCommand = enqueueModemCommand<DisableCallForwardingModemCommand>();
+
+    if (modemCommand == nullptr)
+    {
+        Serial.println(F("SMSForwarder: Cannot disable voice call forwarding (modem command queue full)"));
+        return;
+    }
+
+    modemCommand->callback = callback;
+    modemCommand->state = ModemCommandState::ReadyToSendCommand;
+}
+
+void updateCallForwardingAsync(const char* forwardingNumber, void (*callback)(ModemResult modemResult, const char* forwardingNumber))
+{
+    struct UpdateCallForwardingModemCommand : ModemCommand
+    {
+        void (*callback)(ModemResult modemResult, const char* forwardingNumber);
+
+        char forwardingNumber[17+1];
+
+        virtual bool sendCommand() override
+        {
+            // Enable call forwarding
+            //   <reads>=0: unconditional forwarding
+            //   <mode>=3: registration
+            //   <number>: forwarding number
+            //   <type>=145: international number
+            //   <class>=1: voice calls
+            sendCommandToModem(F("AT+CCFC=0,3,"), forwardingNumber, F(",145,1"), 10000);
+
+            return true;
+        }
+
+        virtual bool tryProcessResponse() override
+        {
+            ModemResult modemResult = parseResultFromModem();
+
+            if (modemResult == ModemResult::None)
+            {
+                return false;
+            }
+
+            if (callback != nullptr)
+            {
+                callback(modemResult, modemResult == ModemResult::OK ? forwardingNumber : nullptr);
+            }
+
+            return true;
+        }
+    };
+
+    UpdateCallForwardingModemCommand* modemCommand = enqueueModemCommand<UpdateCallForwardingModemCommand>();
+
+    if (modemCommand == nullptr)
+    {
+        Serial.println(F("SMSForwarder: Cannot update voice forwarding (modem command queue full)"));
+        return;
+    }
+
+    size_t forwardingNumberLength = strlen(forwardingNumber);
+
+    if (forwardingNumberLength >= sizeof(modemCommand->forwardingNumber))
+    {
+        cancelModemCommand(modemCommand);
+
+        Serial.println(F("SMSForwarder: Cannot update voice forwarding (number too long)"));
+        return;
+    }
+
+    strcpy(modemCommand->forwardingNumber, forwardingNumber);
+
+    modemCommand->callback = callback;
+    modemCommand->state = ModemCommandState::ReadyToSendCommand;
 }
 
 uint8_t parseGSMAlphaFromModem(char* characterBuffer, size_t characterBufferSize, uint8_t charactersToParse)
@@ -2172,7 +2385,7 @@ void delaySerialCommandHelp(unsigned long delay)
 
 void printSerialCommandHelp()
 {
-    Serial.println(F("SMSForwarder: Enter command via serial interface: list, add +491701234567, del +491701234567, voice +491701234567"));
+    Serial.println(F("SMSForwarder: Enter command via serial interface: list, add +491701234567, del +491701234567, voice +491701234567, voice disable"));
 }
 
 void printSerialCommandHelpWithDelay()
@@ -2260,11 +2473,86 @@ void executeSerialCommandDel(const char* argumentsPtr)
     printSMSDestinations();
 }
 
+void executeSerialCommandVoice(const char* argumentsPtr)
+{
+    if (isEndOfBuffer(argumentsPtr))
+    {
+        queryCallForwardingAsync([](ModemResult modemResult, const char* forwardingNumber)
+        {
+            if (modemResult == ModemResult::OK)
+            {
+                if (forwardingNumber == nullptr)
+                {
+                    Serial.println(F("GSM: Voice call fowarding disabled"));
+                }
+                else
+                {
+                    Serial.print(F("GSM: Voice call forwarding to "));
+                    Serial.println(forwardingNumber);
+                }
+            }
+            else
+            {
+                Serial.print(F("GSM: Error querying voice call forwarding: "));
+                Serial.println(static_cast<int>(modemResult));
+            }
+        });
+
+        return;
+    }
+
+    const char* parseDisablePtr = argumentsPtr;
+
+    if (skipCharactersInBuffer(parseDisablePtr, F("disable")) &&
+        isEndOfBuffer(parseDisablePtr))
+    {
+        disableCallForwardingAsync([](ModemResult modemResult)
+        {
+            if (modemResult == ModemResult::OK)
+            {
+                Serial.println(F("GSM: Successfully disabled voice call forwarding"));
+            }
+            else
+            {
+                Serial.print(F("GSM: Error disabling voice call forwarding: "));
+                Serial.println(static_cast<int>(modemResult));
+            }
+        });
+
+        return;
+    }
+
+    const char* parseForwardingNumberPtr = argumentsPtr;
+
+    if (skipCharacterInBuffer(parseForwardingNumberPtr, '+') &&
+        skipCharactersInBuffer(parseForwardingNumberPtr, isDecDigit, 7, 17) &&
+        isEndOfBuffer(parseForwardingNumberPtr))
+    {
+        updateCallForwardingAsync(argumentsPtr, [](ModemResult modemResult, const char* forwardingNumber)
+        {
+            if (modemResult == ModemResult::OK)
+            {
+                Serial.print(F("GSM: Successfully enabled voice call forwarding to "));
+                Serial.println(forwardingNumber);
+            }
+            else
+            {
+                Serial.print(F("GSM: Error updating voice call forwarding: "));
+                Serial.println(static_cast<int>(modemResult));
+            }
+        });
+
+        return;
+    }
+
+    Serial.println(F("SMSForwarder: Invalid voice call forwarding number (expected \"+491701234567\" or \"disable\")"));
+}
+    
 void executeSerialCommandAT(const char* command)
 {
     struct CustomATModemCommand : ModemCommand
     {
-        char command[32+1];
+        char command[48+1];
 
         virtual bool sendCommand() override
         {
@@ -2315,17 +2603,17 @@ void executeSerialCommandAT(const char* command)
 
     size_t commandLength = strlen(command);
 
-    if (commandLength < sizeof(modemCommand->command))
+    if (commandLength >= sizeof(modemCommand->command))
     {
-        strcpy(modemCommand->command, command);
+        cancelModemCommand(modemCommand);
 
-        modemCommand->state = ModemCommandState::ReadyToSendCommand;
+        Serial.println(F("SMSForwarder: Cannot run custom AT command (too long)"));
         return;
     }
 
-    Serial.println(F("SMSForwarder: Cannot run custom AT command (too long)"));
+    strcpy(modemCommand->command, command);
 
-    cancelModemCommand(modemCommand);
+    modemCommand->state = ModemCommandState::ReadyToSendCommand;
 }
 
 void printSMSDestinations()
@@ -2563,9 +2851,9 @@ bool tryProcessUnsolicitedReceiveSMS()
 
     if (modemCommand == nullptr)
     {
-        Serial.println(F("SMSForwarder: Cannot forward SMS (modem command queue full)"));
-
         discardLineFromModem();
+
+        Serial.println(F("SMSForwarder: Cannot forward SMS (modem command queue full)"));
         return true;
     }
 
@@ -2600,10 +2888,10 @@ bool tryProcessUnsolicitedReceiveSMS()
         return true;
     }
 
-    Serial.println(F("SMSForwarder: Unable to parse SMS"));
-
     discardLineFromModem();
     cancelModemCommand(modemCommand);
+
+    Serial.println(F("SMSForwarder: Unable to parse SMS"));
     return true;
 }
 
@@ -2756,7 +3044,7 @@ void loop()
     }
 }
 
-char SerialCommandBuffer[32+1];
+char SerialCommandBuffer[48+1];
 uint8_t SerialCommandLength = 0;
 
 bool loopSerial()
@@ -2852,6 +3140,14 @@ bool loopSerial()
                     {
                         skipCharactersInBuffer(serialCommandCharacterPtr, isHorizontalWhitespace, 1, 1);
                         executeSerialCommandDel(serialCommandCharacterPtr);
+                        break;
+                    }
+
+                    if (skipCharactersInBuffer(serialCommandCharacterPtr, F("voice")) &&
+                        isNonWordCharacterInBuffer(serialCommandCharacterPtr))
+                    {
+                        skipCharactersInBuffer(serialCommandCharacterPtr, isHorizontalWhitespace, 1, 1);
+                        executeSerialCommandVoice(serialCommandCharacterPtr);
                         break;
                     }
 
