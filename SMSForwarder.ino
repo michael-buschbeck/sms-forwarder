@@ -1654,6 +1654,75 @@ void printSerialCommandHelp()
     Serial.println(F("SMSForwarder: Enter command via serial interface: list, add +491701234567, del +491701234567"));
 }
 
+void executeSerialCommandAdd(const char* argumentsPtr)
+{
+    const char* destinationPtr = argumentsPtr;
+
+    if (skipCharacterInBuffer(argumentsPtr, '+') &&
+        skipCharactersInBuffer(argumentsPtr, isDecDigit, 7, 17) &&
+        isEndOfBuffer(argumentsPtr))
+    {
+        int destinationIndex = findSMSDestination(destinationPtr);
+
+        if (destinationIndex >= 0)
+        {
+            Serial.print(F("SMSForwarder: Destination phone number already configured in slot "));
+            Serial.println(destinationIndex);
+
+            printSMSDestinations();
+            return;
+        }
+
+        int emptyDestinationIndex = findSMSDestination();
+
+        if (emptyDestinationIndex < 0)
+        {
+            Serial.println(F("SMSForwarder: No empty slot for new destination phone number"));
+
+            printSMSDestinations();
+            return;
+        }
+
+        memset(EEPROMConfig.destinations[emptyDestinationIndex], 0, sizeof(EEPROMConfig.destinations[emptyDestinationIndex]));
+        strcpy(EEPROMConfig.destinations[emptyDestinationIndex], destinationPtr);
+
+        EEPROM.put(0, EEPROMConfig);
+
+        Serial.print(F("SMSForwarder: Configured destination phone number in slot "));
+        Serial.println(emptyDestinationIndex);
+
+        printSMSDestinations();
+    }
+    else
+    {
+        Serial.println(F("SMSForwarder: Invalid destination phone number (expected international phone number format)"));
+    }
+}
+
+void executeSerialCommandDel(const char* argumentsPtr)
+{
+    const char* destinationPtr = argumentsPtr;
+
+    int destinationIndex = findSMSDestination(destinationPtr);
+
+    if (destinationIndex < 0)
+    {
+        Serial.println(F("SMSForwarder: Destination phone number not configured"));
+
+        printSMSDestinations();
+        return;
+    }
+
+    memset(EEPROMConfig.destinations[destinationIndex], 0, sizeof(EEPROMConfig.destinations[destinationIndex]));
+
+    EEPROM.put(0, EEPROMConfig);
+
+    Serial.print(F("SMSForwarder: Deleted destination phone number from slot "));
+    Serial.println(destinationIndex);
+
+    printSMSDestinations();
+}
+
 void printSMSDestinations()
 {
     for (uint8_t destinationIndex = 0; destinationIndex < EEPROMConfigSchema::NumDestinations; ++destinationIndex)
@@ -1697,6 +1766,104 @@ int findSMSDestination(const char* destination)
     }
 
     return -1;
+}
+
+void forwardSMS(const char* sender, size_t senderLength, char* messageBuffer, size_t messageBufferSize, Encoding messageEncoding, size_t messageLength)
+{
+    switch (messageEncoding)
+    {
+        case Encoding::GSMBYTES:
+        {
+            char* messageCharacterPtr = messageBuffer + messageLength;
+            char* messageCharacterPtrEnd = messageBuffer + messageBufferSize - 1;
+
+            if (messageCharacterPtr + senderLength + 2 < messageCharacterPtrEnd)
+            {
+                *messageCharacterPtr++ = '\n';
+                *messageCharacterPtr++ = '\n';
+
+                memcpy(messageCharacterPtr, sender, senderLength);
+                messageCharacterPtr += senderLength;
+            }
+
+            *messageCharacterPtr = '\xFF';
+
+            messageLength = messageCharacterPtr - messageBuffer;
+        }
+        break;
+
+        case Encoding::UCS2BE:
+        {
+            wchar_t* messageCodepointPtr = reinterpret_cast<wchar_t*>(messageBuffer + messageLength);
+            wchar_t* messageCodepointPtrEnd = reinterpret_cast<wchar_t*>(messageBuffer + messageBufferSize) - 1;
+
+            if (messageCodepointPtr + senderLength + 2 < messageCodepointPtrEnd)
+            {
+                *messageCodepointPtr++ = swapBytes('\n');
+                *messageCodepointPtr++ = swapBytes('\n');
+
+                bool isExtended = false;
+
+                const char* senderCharacterPtr = sender;
+                const char* senderCharacterPtrEnd = sender + senderLength;
+
+                for (; senderCharacterPtr < senderCharacterPtrEnd; ++senderCharacterPtr)
+                {
+                    unsigned char senderCharacter = *senderCharacterPtr;
+
+                    if (senderCharacter > '\x7F')
+                    {
+                        break;
+                    }
+
+                    if (senderCharacter == '\x1B')
+                    {
+                        isExtended = true;
+                        continue;
+                    }
+
+                    wchar_t senderCodepoint = lookupUnicodeForGSM(senderCharacter, isExtended);
+                    *messageCodepointPtr++ = swapBytes(senderCodepoint);
+
+                    isExtended = false;
+                }
+            }
+            
+            *messageCodepointPtr = '\0';
+
+            messageLength = reinterpret_cast<char*>(messageCodepointPtr) - messageBuffer;
+        }
+        break;
+
+        default: break;
+    }
+
+    Serial.print(F("SMSForwarder: Outgoing SMS message: "));
+    printlnEncoded(Serial, messageBuffer, messageLength, messageEncoding);
+
+    for (const char* destination : EEPROMConfig.destinations)
+    {
+        if (destination[0] == '\0')
+        {
+            continue;
+        }
+
+        Serial.print(F("SMSForwarder: Forwarding to "));
+        Serial.println(destination);
+
+        size_t destinationLength = strlen(destination);
+        size_t submitPDUSize = computeSMSPDUSize(destination, destinationLength, messageEncoding, messageLength);
+
+        if (submitPDUSize > 0)
+        {
+            sendCommandToModem(F("AT+CMGS="), submitPDUSize, 120000);
+            sendSMSPDUToModem(destination, destinationLength, messageBuffer, messageEncoding, messageLength);
+        }
+        else
+        {
+            Serial.println(F("SMSForwarder: Cannot send SMS because of invalid SMS message information"));
+        }
+    }
 }
 
 bool skipCharacterInBuffer(const char*& characterPtr, char characterToSkip)
@@ -1999,72 +2166,15 @@ void loopSerial()
                         isNonWordCharacterInBuffer(serialCommandCharacterPtr))
                     {
                         skipCharactersInBuffer(serialCommandCharacterPtr, isHorizontalWhitespace, 1, 1);
-
-                        const char* destinationPtr = serialCommandCharacterPtr;
-
-                        if (skipCharacterInBuffer(serialCommandCharacterPtr, '+') &&
-                            skipCharactersInBuffer(serialCommandCharacterPtr, isDecDigit, 7, 17) &&
-                            isEndOfBuffer(serialCommandCharacterPtr))
-                        {
-                            int destinationIndex = findSMSDestination(destinationPtr);
-
-                            if (destinationIndex >= 0)
-                            {
-                                Serial.print(F("SMSForwarder: Destination phone number already configured in slot "));
-                                Serial.println(destinationIndex);
-                                printSMSDestinations();
-                                break;
-                            }
-
-                            int emptyDestinationIndex = findSMSDestination();
-
-                            if (emptyDestinationIndex < 0)
-                            {
-                                Serial.println(F("SMSForwarder: No empty slot for new destination phone number"));
-                                printSMSDestinations();
-                                break;
-                            }
-
-                            memset(EEPROMConfig.destinations[emptyDestinationIndex], 0, sizeof(EEPROMConfig.destinations[emptyDestinationIndex]));
-                            strcpy(EEPROMConfig.destinations[emptyDestinationIndex], destinationPtr);
-
-                            EEPROM.put(0, EEPROMConfig);
-
-                            Serial.print(F("SMSForwarder: Configured destination phone number in slot "));
-                            Serial.println(emptyDestinationIndex);
-                            printSMSDestinations();
-                            break;
-                        }
-                        else
-                        {
-                            Serial.println(F("SMSForwarder: Invalid destination phone number (expected international phone number format)"));
-                            break;
-                        }
+                        executeSerialCommandAdd(serialCommandCharacterPtr);
+                        break;
                     }
 
                     if (skipCharactersInBuffer(serialCommandCharacterPtr, F("del")) &&
                         isNonWordCharacterInBuffer(serialCommandCharacterPtr))
                     {
                         skipCharactersInBuffer(serialCommandCharacterPtr, isHorizontalWhitespace, 1, 1);
-
-                        const char* destinationPtr = serialCommandCharacterPtr;
-
-                        int destinationIndex = findSMSDestination(destinationPtr);
-
-                        if (destinationIndex < 0)
-                        {
-                            Serial.println(F("SMSForwarder: Destination phone number not configured"));
-                            printSMSDestinations();
-                            break;
-                        }
-
-                        memset(EEPROMConfig.destinations[destinationIndex], 0, sizeof(EEPROMConfig.destinations[destinationIndex]));
-
-                        EEPROM.put(0, EEPROMConfig);
-
-                        Serial.print(F("SMSForwarder: Deleted destination phone number from slot "));
-                        Serial.println(destinationIndex);
-                        printSMSDestinations();
+                        executeSerialCommandDel(serialCommandCharacterPtr);
                         break;
                     }
 
@@ -2134,101 +2244,7 @@ bool loopModem()
                 Serial.print(F("GSM: SMS message: "));
                 printlnEncoded(Serial, message, sizeof(message), messageEncoding);
 
-                switch (messageEncoding)
-                {
-                    case Encoding::GSMBYTES:
-                    {
-                        char* messageCharacterPtr = message + messageLength;
-                        char* messageCharacterPtrEnd = message + sizeof(message) - 1;
-
-                        if (messageCharacterPtr + senderLength + 2 < messageCharacterPtrEnd)
-                        {
-                            *messageCharacterPtr++ = '\n';
-                            *messageCharacterPtr++ = '\n';
-
-                            memcpy(messageCharacterPtr, sender, senderLength);
-                            messageCharacterPtr += senderLength;
-                        }
-
-                        *messageCharacterPtr = '\xFF';
-
-                        messageLength = messageCharacterPtr - message;
-                    }
-                    break;
-
-                    case Encoding::UCS2BE:
-                    {
-                        wchar_t* messageCodepointPtr = reinterpret_cast<wchar_t*>(message + messageLength);
-                        wchar_t* messageCodepointPtrEnd = reinterpret_cast<wchar_t*>(message + sizeof(message)) - 1;
-
-                        if (messageCodepointPtr + senderLength + 2 < messageCodepointPtrEnd)
-                        {
-                            *messageCodepointPtr++ = swapBytes('\n');
-                            *messageCodepointPtr++ = swapBytes('\n');
-
-                            bool isExtended = false;
-
-                            char* senderCharacterPtr = sender;
-                            char* senderCharacterPtrEnd = sender + senderLength;
-
-                            for (; senderCharacterPtr < senderCharacterPtrEnd; ++senderCharacterPtr)
-                            {
-                                unsigned char senderCharacter = *senderCharacterPtr;
-
-                                if (senderCharacter > '\x7F')
-                                {
-                                    break;
-                                }
-
-                                if (senderCharacter == '\x1B')
-                                {
-                                    isExtended = true;
-                                    continue;
-                                }
-
-                                wchar_t senderCodepoint = lookupUnicodeForGSM(senderCharacter, isExtended);
-                                *messageCodepointPtr++ = swapBytes(senderCodepoint);
-
-                                isExtended = false;
-                            }
-                        }
-                        
-                        *messageCodepointPtr = '\0';
-
-                        messageLength = reinterpret_cast<char*>(messageCodepointPtr) - message;
-                    }
-                    break;
-
-                    default: break;
-                }
-
-                Serial.print(F("SMSForwarder: Outgoing SMS message: "));
-                printlnEncoded(Serial, message, sizeof(message), messageEncoding);
-
-                for (const char* destination : EEPROMConfig.destinations)
-                {
-                    if (destination[0] == '\0')
-                    {
-                        continue;
-                    }
-
-                    Serial.print(F("SMSForwarder: Forwarding to "));
-                    Serial.println(destination);
-
-                    size_t destinationLength = strlen(destination);
-                    size_t submitPDUSize = computeSMSPDUSize(destination, destinationLength, messageEncoding, messageLength);
-
-                    if (submitPDUSize > 0)
-                    {
-                        sendCommandToModem(F("AT+CMGS="), submitPDUSize, 120000);
-                        sendSMSPDUToModem(destination, destinationLength, message, messageEncoding, messageLength);
-                    }
-                    else
-                    {
-                        Serial.println(F("SMSForwarder: Cannot send SMS because of invalid SMS message information"));
-                    }
-                }
-
+                forwardSMS(sender, senderLength, message, sizeof(message), messageEncoding, messageLength);
                 return true;
             }
             else
