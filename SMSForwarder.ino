@@ -11,6 +11,7 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <SoftwareSerial.h>
+#include <new>
 
 #define MODEM_SERIAL_RX_PIN 2
 #define MODEM_SERIAL_TX_PIN 3
@@ -59,8 +60,41 @@ struct ModemSerialState
 enum struct ModemRuntimeState : uint8_t
 {
     Uninitialized = 0,
-    Authorize = 1,
+    Authorize     = 1,
     Active        = 2,
+};
+
+enum struct ModemCommandState : uint8_t
+{
+    Uninitialized          = 0,
+    ReadyToSendCommand     = 1,
+    ReadyToProcessResponse = 2,
+};
+
+struct ModemCommand
+{
+    // Send modem command
+    // Return true if response expected, false if not
+    virtual bool sendCommand() = 0;
+
+    // Process modem response to sent command
+    // Only called when prior command sent indicated that response is expected
+    // Return true if expected response received, false if not (must rollback read buffer)
+    virtual bool tryProcessResponse() = 0;
+
+    // If available, advance to the next command to send
+    // Return true if there is another command to send, false if not
+    virtual bool advanceToNextCommand() { return false; }
+
+    // Clean up anything that was set up specifically for this command
+    virtual ~ModemCommand() = default;
+
+    // State of this command
+    // Set this to ReadyToSendCommand after initialization is complete
+    ModemCommandState state = ModemCommandState::Uninitialized;
+
+    // ModemTimeoutTime initialized after command was sent
+    unsigned long responseTimeoutTime = 0;
 };
 
 enum struct ModemResult : int
@@ -78,36 +112,163 @@ enum struct ModemResult : int
     NoAnswer   = 8,
     Proceeding = 9,
 
-    // Proprietary Quectel result codes
-    InvalidInputValue  = 3765,
-    NonExistentAddress = 3915,
-    UFSStorageFull     = 3916,
-    DriveFull          = 3917,
-    DriveError         = 3918,
-    FileNotFound1      = 3919,
-    InvalidFileName    = 3920,
-    FileAlreadyExisted = 3921,
-    FailedToCreateFile = 3922,
-    FailedToWriteFile  = 3923,
-    FailedToOpenFile   = 3924,
-    FailedToReadFile   = 3925,
-    ExceedMaxLength    = 4000,
-    OpenFileFail       = 4001,
-    WriteFileFail      = 4002,
-    GetSizeFail        = 4003,
-    ReadFail           = 4004,
-    ListFileFail       = 4005,
-    DeleteFileFail     = 4006,
-    GetDiskInfoFail    = 4007,
-    NoSpace            = 4008,
-    TimeOut            = 4009,
-    FileNotFound2      = 4010,
-    FileTooLarge       = 4011,
-    FileAlreadyExist   = 4012,
-    InvalidParameter   = 4013,
-    DriverError        = 4014,
-    CreateFail         = 4015,
-    AccessDenied       = 4016,
+    // Quectel file access result codes
+    FS_InvalidInputValue                          =  3765,
+    FS_NonExistentAddress                         =  3915,
+    FS_UFSStorageFull                             =  3916,
+    FS_DriveFull                                  =  3917,
+    FS_DriveError                                 =  3918,
+    FS_FileNotFound1                              =  3919,
+    FS_InvalidFileName                            =  3920,
+    FS_FileAlreadyExisted                         =  3921,
+    FS_FailedToCreateFile                         =  3922,
+    FS_FailedToWriteFile                          =  3923,
+    FS_FailedToOpenFile                           =  3924,
+    FS_FailedToReadFile                           =  3925,
+    FS_ExceedMaxLength                            =  4000,
+    FS_OpenFileFail                               =  4001,
+    FS_WriteFileFail                              =  4002,
+    FS_GetSizeFail                                =  4003,
+    FS_ReadFail                                   =  4004,
+    FS_ListFileFail                               =  4005,
+    FS_DeleteFileFail                             =  4006,
+    FS_GetDiskInfoFail                            =  4007,
+    FS_NoSpace                                    =  4008,
+    FS_TimeOut                                    =  4009,
+    FS_FileNotFound2                              =  4010,
+    FS_FileTooLarge                               =  4011,
+    FS_FileAlreadyExist                           =  4012,
+    FS_InvalidParameter                           =  4013,
+    FS_DriverError                                =  4014,
+    FS_CreateFail                                 =  4015,
+    FS_AccessDenied                               =  4016,
+
+    // Quectel +CME ERROR result codes (shifted by 10000)
+    CME                                           = 10000,
+    CME_PhoneFailure                              = 10000,
+    CME_NoConnectionToPhone                       = 10001,
+    CME_PhoneAdaptorLinkReserved                  = 10002,
+    CME_OperationNotAllowed                       = 10003,
+    CME_OperationNotSupported                     = 10004,
+    CME_PHSIMPINRequired                          = 10005,
+    CME_PHFSIMPINRequired                         = 10006,
+    CME_PHFSIMPUKRequired                         = 10007,
+    CME_SIMNotInserted                            = 10010,
+    CME_SIMPINRequired                            = 10011,
+    CME_SIMPUKRequired                            = 10012,
+    CME_SIMFailure                                = 10013,
+    CME_SIMBusy                                   = 10014,
+    CME_SIMWrong                                  = 10015,
+    CME_IncorrectPassword                         = 10016,
+    CME_SIMPIN2Required                           = 10017,
+    CME_SIMPUK2Required                           = 10018,
+    CME_MemoryFull                                = 10020,
+    CME_InvalidIndex                              = 10021,
+    CME_NotFound                                  = 10022,
+    CME_MemoryFailure                             = 10023,
+    CME_TextStringTooLong                         = 10024,
+    CME_InvalidCharactersInTextString             = 10025,
+    CME_DialStringTooLong                         = 10026,
+    CME_InvalidCharactersInDialString             = 10027,
+    CME_NoNetworkService                          = 10030,
+    CME_NetworkTimeout                            = 10031,
+    CME_NetworkNotAllowedEmergencyCallsOnly       = 10032,
+    CME_NetworkPersonalizationPINRequired         = 10040,
+    CME_NetworkPersonalizationPUKRequired         = 10041,
+    CME_NetworkSubsetPersonalizationPINRequired   = 10042,
+    CME_NetworkSubsetPersonalizationPUKRequired   = 10043,
+    CME_ServiceProviderPersonalizationPINRequired = 10044,
+    CME_ServiceProviderPersonalizationPUKRequired = 10045,
+    CME_CorporatePersonalizationPINRequired       = 10046,
+    CME_CorporatePersonalizationPUKRequired       = 10047,
+    CME_IllegalMS                                 = 10103,
+    CME_IllegalME                                 = 10106,
+    CME_GPRSServicesNotAllowed                    = 10107,
+    CME_PLMNNotAllowed                            = 10111,
+    CME_LocationAreaNotAllowed                    = 10112,
+    CME_RoamingNotAllowedInThisLocationArea       = 10113,
+    CME_ServiceOptionNotSupported                 = 10132,
+    CME_RequestedServiceOptionNotSubscribed       = 10133,
+    CME_ServiceOptionTemporarilyOutOfOrder        = 10134,
+    CME_UnspecifiedGPRSError                      = 10148,
+    CME_PDPAuthenticationFailure                  = 10149,
+    CME_InvalidMobileClass                        = 10150,
+    CME_LinkNSSPPersonPINRequired                 = 10151,
+    CME_LinkNSSPPersonPUKRequired                 = 10152,
+    CME_LinkSIMCPersonPINRequired                 = 10153,
+    CME_LinkSIMCPersonPUKRequired                 = 10154,
+    CME_CommandConflict                           = 10302,
+    CME_UnrecognizedCommand                       = 10601,
+    CME_ReturnError                               = 10602,
+    CME_SyntaxError                               = 10603,
+    CME_Unspecified                               = 10604,
+    CME_DataTransferAlready                       = 10605,
+    CME_ActionAlready                             = 10606,
+    CME_NotATCommand                              = 10607,
+    CME_MultiCommandTooLong                       = 10608,
+    CME_AbortCOPS                                 = 10609,
+    CME_NoCallDisconnect                          = 10610,
+    CME_UnreadRecordsOnSIM                        = 13513,
+    CME_PSBusy                                    = 13515,
+    CME_CouldNotReadSMSParametersFromSIM          = 13516,
+    CME_SMNotReady                                = 13517,
+    CME_InvalidParameter                          = 13518,
+    CME_CSCSModeNotFound                          = 13738,
+    CME_CPOLOperationFormatWrong                  = 13742,
+    CME_InvalidInputValue                         = 13765,
+    CME_UnableToGetControl                        = 13769,
+    CME_CallSetupInProgress                       = 13771,
+    CME_SIMPoweredDown                            = 13772,
+    CME_InvalidCFUNState                          = 13773,
+    CME_InvalidARFCN                              = 13774,
+    CME_ThePinIsNotInGPIOMode                     = 13775,
+
+    // Quectel +CMS ERROR result codes (shifted by 20000)
+    CMS                                           = 20000,
+    CMS_MEFailure                                 = 20300,
+    CMS_SMSMEReserved                             = 20301,
+    CMS_OperationNotAllowed                       = 20302,
+    CMS_OperationNotSupported                     = 20303,
+    CMS_InvalidPDUMode                            = 20304,
+    CMS_InvalidTextMode                           = 20305,
+    CMS_SIMNotInserted                            = 20310,
+    CMS_SIMPINNecessary                           = 20311,
+    CMS_PHSIMPINNecessary                         = 20312,
+    CMS_SIMFailure                                = 20313,
+    CMS_SIMBusy                                   = 20314,
+    CMS_SIMWrong                                  = 20315,
+    CMS_SIMPUKRequired                            = 20316,
+    CMS_SIMPIN2Required                           = 20317,
+    CMS_SIMPUK2Required                           = 20318,
+    CMS_MemoryFailure                             = 20320,
+    CMS_InvalidMemoryIndex                        = 20321,
+    CMS_MemoryFull                                = 20322,
+    CMS_SMSCAddressUnknown                        = 20330,
+    CMS_NoNetwork                                 = 20331,
+    CMS_NetworkTimeout                            = 20332,
+    CMS_Unknown                                   = 20500,
+    CMS_SIMNotReady                               = 20512,
+    CMS_MessageLengthExceeds                      = 20513,
+    CMS_InvalidRequestParameters                  = 20514,
+    CMS_MEStorageFailure                          = 20515,
+    CMS_InvalidServiceMode                        = 20517,
+    CMS_MoreMessageToSendStateError               = 20528,
+    CMS_MOSMSIsNotAllow                           = 20529,
+    CMS_GPRSIsSuspended                           = 20530,
+    CMS_MEStorageFull                             = 20531,
+    CMS_UnreadRecordsOnSIM                        = 23513,
+    CMS_PSBusy                                    = 23515,
+    CMS_CouldNotReadSMSParametersFromSIM          = 23516,
+    CMS_SMNotReady                                = 23517,
+    CMS_InvalidParameter                          = 23518,
+    CMS_IncorrectOperFormat                       = 23742,
+    CMS_InvalidInputValue                         = 23765,
+    CMS_UnableToGetControlOfRequiredModule        = 23769,
+    CMS_CallSetupInProgress                       = 23771,
+    CMS_SIMPoweredDown                            = 23772,
+    CMS_UnableToOperateInThisCFUNState            = 23773,
+    CMS_InvalidARFCNInThisBand                    = 23774,
+    CMS_ThePinIsNotInGPIOMode                     = 23775,
 };
 
 enum struct Encoding : uint8_t
@@ -275,23 +436,91 @@ const Mapping<char, wchar_t> GSMToUnicodeExtension[] PROGMEM =
 
 SoftwareSerial ModemSerial(MODEM_SERIAL_RX_PIN, MODEM_SERIAL_TX_PIN);
 
+bool skipCharacterInBuffer(const char*& characterPtr, char characterToSkip)
+{
+    if (*characterPtr == characterToSkip)
+    {
+        characterPtr++;
+        return true;
+    }
+
+    return false;
+}
+
+template<typename char_predicate_t>
+bool skipCharactersInBuffer(const char*& characterPtr, char_predicate_t isCharacterToSkip, size_t minCharactersToSkip, size_t maxCharactersToSkip)
+{
+    const char* characterToCheckPtr = characterPtr;
+    const char* characterToCheckPtrEnd = characterPtr + maxCharactersToSkip;
+
+    while (characterToCheckPtr < characterToCheckPtrEnd && isCharacterToSkip(*characterToCheckPtr))
+    {
+        characterToCheckPtr++;
+    }
+
+    if (characterToCheckPtr >= characterPtr + minCharactersToSkip)
+    {
+        characterPtr = characterToCheckPtr;
+        return true;
+    }
+
+    return false;
+}
+
+bool skipCharactersInBuffer(const char*& characterPtr, const __FlashStringHelper* charactersToSkip)
+{
+    const char* characterToCheckPtr = characterPtr;
+
+    PGM_P characterToSkipPtr = reinterpret_cast<PGM_P>(charactersToSkip);
+
+    while (true)
+    {
+        char characterToSkip = pgm_read_byte(characterToSkipPtr++);
+
+        if (characterToSkip == '\0')
+        {
+            characterPtr = characterToCheckPtr;
+            return true;
+        }
+
+        if (!skipCharacterInBuffer(characterToCheckPtr, characterToSkip))
+        {
+            return false;
+        }
+    }
+}
+
+bool isEndOfBuffer(const char* characterPtr)
+{
+    return *characterPtr == '\0';
+}
+
+bool isNonWordCharacterInBuffer(const char* characterPtr)
+{
+    char character = *characterPtr;
+
+    return (character != '_') &&
+           (character < '0' || character > '9') &&
+           (character < 'A' || character > 'Z') &&
+           (character < 'a' || character > 'z');
+}
+
 constexpr uint16_t swapBytes(uint16_t value)
 {
     return (value >> 8) | (value << 8);
 }
 
-unsigned long ModemTimeoutStart = 0;
-unsigned long ModemTimeout = 0;
+unsigned long ModemTimeoutTime = 0;
 
 void startModemTimeout(unsigned long timeout)
 {
-    ModemTimeoutStart = millis();
-    ModemTimeout = timeout;
+    ModemTimeoutTime = millis() + timeout;
 }
 
 bool isModemTimeout()
 {
-    return millis() - ModemTimeoutStart >= ModemTimeout;
+    signed long remainingMillis = static_cast<signed long>(ModemTimeoutTime - millis());
+    return remainingMillis <= 0;
 }
 
 size_t ModemSubStreamDataRemaining = static_cast<size_t>(-1);
@@ -317,6 +546,75 @@ void closeModemSubStream()
     ModemSubStreamDataRemaining = static_cast<size_t>(-1);
 }
 
+char ModemReadRollbackBuffer[16];
+uint8_t ModemReadRollbackWriteOffset = sizeof(ModemReadRollbackBuffer) + 1;
+uint8_t ModemReadRollbackReadOffset = 0;
+uint8_t ModemReadRollbackReadLength = 0;
+
+void markReadFromModemRollback()
+{
+    // If currently consuming rollback buffer, shift remaining contents to its start
+    if (ModemReadRollbackReadOffset < ModemReadRollbackReadLength)
+    {
+        memmove(
+            ModemReadRollbackBuffer,
+            ModemReadRollbackBuffer + ModemReadRollbackReadOffset,
+            ModemReadRollbackReadLength - ModemReadRollbackReadOffset);
+
+        ModemReadRollbackReadLength -= ModemReadRollbackReadOffset;
+        ModemReadRollbackReadOffset = 0;
+    }
+    else
+    {
+        ModemReadRollbackReadLength = 0;
+        ModemReadRollbackReadOffset = 0;
+    }
+
+    // Collect characters read from the stream behind already buffered characters
+    ModemReadRollbackWriteOffset = ModemReadRollbackReadLength;
+}
+
+void releaseReadFromModemRollback()
+{
+    // Disable collecting more into the buffer
+    ModemReadRollbackWriteOffset = sizeof(ModemReadRollbackBuffer) + 1;
+}
+
+bool seekReadFromModemRollback()
+{
+    // If currently consuming rollback buffer, restart at its beginning
+    if (ModemReadRollbackReadLength > 0)
+    {
+        if (ModemSubStreamDataRemaining != static_cast<size_t>(-1))
+        {
+            ModemSubStreamDataRemaining += ModemReadRollbackReadOffset;
+        }
+
+        ModemReadRollbackReadOffset = 0;
+    }
+    // Otherwise start consuming all buffered data
+    else
+    {
+        if (ModemReadRollbackWriteOffset > sizeof(ModemReadRollbackBuffer))
+        {
+            return false;
+        }
+
+        ModemReadRollbackReadLength = ModemReadRollbackWriteOffset;
+        ModemReadRollbackReadOffset = 0;
+
+        if (ModemSubStreamDataRemaining != static_cast<size_t>(-1))
+        {
+            ModemSubStreamDataRemaining += ModemReadRollbackReadLength;
+        }
+    }
+
+    // Disable collecting more into the buffer (needs a new mark)
+    ModemReadRollbackWriteOffset = sizeof(ModemReadRollbackBuffer) + 1;
+
+    return true;
+}
+
 int peekCharacterFromModem()
 {
     if (ModemSubStreamDataRemaining == 0)
@@ -324,34 +622,48 @@ int peekCharacterFromModem()
         return ModemSerialState::EndOfStream;
     }
 
+    if (ModemReadRollbackReadOffset < ModemReadRollbackReadLength)
+    {
+        return ModemReadRollbackBuffer[ModemReadRollbackReadOffset];
+    }
+
     return ModemSerial.peek();
 }
 
-void discardCharacterFromModem(bool echo = false)
+void discardCharacterFromModem()
 {
     if (ModemSubStreamDataRemaining == 0)
     {
         return;
     }
 
+    if (ModemReadRollbackReadOffset < ModemReadRollbackReadLength)
+    {
+        ModemReadRollbackReadOffset++;
+        return;
+    }
+
     int maybeCharacter = ModemSerial.read();
 
-    if (ModemSubStreamDataRemaining != static_cast<size_t>(-1) && maybeCharacter != ModemSerialState::NoData)
+    if (maybeCharacter == ModemSerialState::NoData)
+    {
+        return;
+    }
+
+    if (ModemSubStreamDataRemaining != static_cast<size_t>(-1))
     {
         ModemSubStreamDataRemaining--;
     }
 
-    if (echo && maybeCharacter > 0)
+    if (ModemReadRollbackWriteOffset < sizeof(ModemReadRollbackBuffer))
     {
-        if (maybeCharacter >= 0x20)
-        {
-            Serial.write(maybeCharacter);
-        }
-        else
-        {
-            Serial.print(F("\\x"));
-            Serial.print(maybeCharacter, HEX);
-        }
+        char character = static_cast<char>(maybeCharacter);
+        ModemReadRollbackBuffer[ModemReadRollbackWriteOffset] = character;
+    }
+    
+    if (ModemReadRollbackWriteOffset <= sizeof(ModemReadRollbackBuffer))
+    {
+        ModemReadRollbackWriteOffset++;
     }
 }
 
@@ -384,7 +696,21 @@ bool skipCharacterFromModem(char_predicate_t isCharacterToSkip, bool echo = fals
                 break;
             }
 
-            discardCharacterFromModem(echo);
+            if (echo)
+            {
+                if (maybeCharacter >= 0x20)
+                {
+                    Serial.write(maybeCharacter);
+                }
+                else
+                {
+                    Serial.print(F("\\x"));
+                    Serial.print(maybeCharacter / 0x10, HEX);
+                    Serial.print(maybeCharacter & 0x0F, HEX);
+                }
+            }
+
+            discardCharacterFromModem();
             return true;
         }
     }
@@ -397,7 +723,7 @@ bool skipCharacterFromModem(char characterToSkip, bool echo = false)
     return skipCharacterFromModem([characterToSkip](char character) { return character == characterToSkip; }, echo);
 }
 
-bool skipCharactersFromModem(const __FlashStringHelper* charactersToSkip)
+bool skipCharactersFromModem(const __FlashStringHelper* charactersToSkip, bool skipTrailingHorizontalWhitespace = true)
 {
     PGM_P characterToSkipPtr = reinterpret_cast<PGM_P>(charactersToSkip);
 
@@ -407,7 +733,7 @@ bool skipCharactersFromModem(const __FlashStringHelper* charactersToSkip)
 
         if (characterToSkip == '\0')
         {
-            return true;
+            break;
         }
 
         if (!skipCharacterFromModem(characterToSkip))
@@ -415,6 +741,13 @@ bool skipCharactersFromModem(const __FlashStringHelper* charactersToSkip)
             return false;
         }
     }
+
+    if (skipTrailingHorizontalWhitespace)
+    {
+        skipHorizontalWhitespaceFromModem();
+    }
+
+    return true;
 }
 
 template<typename char_predicate_t>
@@ -490,19 +823,13 @@ size_t readCharactersFromModemUntil(char* buffer, size_t bufferSize, char stopCh
     return readCharactersFromModemWhile(buffer, bufferSize, [stopCharacter](char character) { return character != stopCharacter; });
 }
 
-size_t readLineFromModem(char* buffer, size_t bufferSize, bool skipHorizontalWhitespace = true, bool skipEndOfLine = true)
+size_t readLineFromModem(char* buffer, size_t bufferSize, bool skipEndOfLine = true)
 {
-    if (skipHorizontalWhitespace)
-    {
-        skipHorizontalWhitespaceFromModem();
-    }
-
     size_t bufferLength = readCharactersFromModemUntil(buffer, bufferSize, '\r');
 
     if (skipEndOfLine)
     {
-        skipCharacterFromModem('\r');
-        skipCharacterFromModem('\n');
+        skipEndOfLineFromModem();
     }
 
     return bufferLength;
@@ -536,8 +863,12 @@ void skipHorizontalWhitespaceFromModem()
 
 bool skipEndOfLineFromModem()
 {
-    return skipCharacterFromModem('\r') &&
-           skipCharacterFromModem('\n');
+    bool skipped;
+
+    skipped = skipCharacterFromModem('\r');
+    skipped = skipCharacterFromModem('\n') || skipped;
+
+    return skipped;
 }
 
 void discardLineFromModem(bool echo = false)
@@ -549,8 +880,155 @@ void discardLineFromModem(bool echo = false)
         Serial.println();
     }
 
-    skipCharacterFromModem('\r');
-    skipCharacterFromModem('\n');
+    skipEndOfLineFromModem();
+}
+
+uint8_t ModemCommandBuffer[180*3] = {0};
+
+size_t computeAllocatedModemCommandSize()
+{
+    uint8_t* modemCommandEntryPtr = ModemCommandBuffer;
+    uint8_t* modemCommandEntryPtrEnd = ModemCommandBuffer + sizeof(ModemCommandBuffer) - sizeof(size_t) + 1;
+
+    while (modemCommandEntryPtr < modemCommandEntryPtrEnd)
+    {
+        size_t skipModemCommandSize = *reinterpret_cast<size_t*>(modemCommandEntryPtr);
+        
+        if (skipModemCommandSize == 0)
+        {
+            break;
+        }
+
+        modemCommandEntryPtr += sizeof(size_t);
+        modemCommandEntryPtr += skipModemCommandSize;
+    }
+
+    return modemCommandEntryPtr - ModemCommandBuffer;
+}
+
+void* allocateModemCommand(size_t modemCommandSize)
+{
+    size_t allocatedModemCommandEntrySize = computeAllocatedModemCommandSize();
+
+    uint8_t* modemCommandEntryPtr = ModemCommandBuffer + allocatedModemCommandEntrySize;
+
+    allocatedModemCommandEntrySize += sizeof(size_t);
+    allocatedModemCommandEntrySize += modemCommandSize;
+
+    if (allocatedModemCommandEntrySize > sizeof(ModemCommandBuffer))
+    {
+        return nullptr;
+    }
+
+    *reinterpret_cast<size_t*>(modemCommandEntryPtr) = modemCommandSize;
+    
+    if (allocatedModemCommandEntrySize + sizeof(size_t) <= sizeof(ModemCommandBuffer))
+    {
+        *reinterpret_cast<size_t*>(ModemCommandBuffer + allocatedModemCommandEntrySize) = 0;
+    }
+
+    return modemCommandEntryPtr + sizeof(size_t);
+}
+
+template<typename modem_command_t>
+modem_command_t* enqueueModemCommand()
+{
+    void* modemCommandPtr = allocateModemCommand(sizeof(modem_command_t));
+
+    if (modemCommandPtr == nullptr)
+    {
+        return nullptr;
+    }
+
+    return new(modemCommandPtr) modem_command_t;
+}
+
+ModemCommand* peekModemCommand()
+{
+    size_t modemCommandSize = *reinterpret_cast<size_t*>(ModemCommandBuffer);
+
+    if (modemCommandSize == 0)
+    {
+        return nullptr;
+    }
+
+    return reinterpret_cast<ModemCommand*>(ModemCommandBuffer + sizeof(size_t));
+}
+
+void dequeueModemCommand()
+{
+    size_t modemCommandSize = *reinterpret_cast<size_t*>(ModemCommandBuffer);
+
+    if (modemCommandSize == 0)
+    {
+        return;
+    }
+
+    ModemCommand* modemCommand = reinterpret_cast<ModemCommand*>(ModemCommandBuffer + sizeof(size_t));
+    modemCommand->~ModemCommand();
+
+    size_t remainingModemCommandEntrySize = computeAllocatedModemCommandSize();
+    remainingModemCommandEntrySize -= sizeof(size_t);
+    remainingModemCommandEntrySize -= modemCommandSize;
+
+    if (remainingModemCommandEntrySize == 0)
+    {
+        *reinterpret_cast<size_t*>(ModemCommandBuffer) = 0;
+    }
+    else
+    {
+        memmove(
+            ModemCommandBuffer,
+            ModemCommandBuffer + sizeof(size_t) + modemCommandSize,
+            remainingModemCommandEntrySize);
+
+        if (remainingModemCommandEntrySize + sizeof(size_t) <= sizeof(ModemCommandBuffer))
+        {
+            *reinterpret_cast<size_t*>(ModemCommandBuffer + remainingModemCommandEntrySize) = 0;
+        }
+    }
+}
+
+void cancelModemCommand(ModemCommand* modemCommand)
+{
+    if (modemCommand == nullptr)
+    {
+        return;
+    }
+
+    uint8_t* modemCommandEntryPtr = reinterpret_cast<uint8_t*>(modemCommand) - sizeof(size_t);
+
+    size_t allocatedModemCommandEntrySize = computeAllocatedModemCommandSize();
+
+    if (modemCommandEntryPtr < ModemCommandBuffer ||
+        modemCommandEntryPtr >= ModemCommandBuffer + allocatedModemCommandEntrySize)
+    {
+        return;
+    }
+
+    size_t modemCommandSize = *reinterpret_cast<size_t*>(modemCommandEntryPtr);
+
+    modemCommand->~ModemCommand();
+
+    size_t prevModemCommandEntrySize = modemCommandEntryPtr - ModemCommandBuffer;
+    size_t nextModemCommandEntrySize = allocatedModemCommandEntrySize - prevModemCommandEntrySize - (sizeof(size_t) + modemCommandSize);
+
+    if (nextModemCommandEntrySize == 0)
+    {
+        *reinterpret_cast<size_t*>(modemCommandEntryPtr) = 0;
+    }
+    else
+    {
+        memmove(
+            ModemCommandBuffer + prevModemCommandEntrySize,
+            ModemCommandBuffer + prevModemCommandEntrySize + sizeof(size_t) + modemCommandSize,
+            nextModemCommandEntrySize);
+
+        if (prevModemCommandEntrySize + nextModemCommandEntrySize + sizeof(size_t) < sizeof(ModemCommandBuffer))
+        {
+            *reinterpret_cast<size_t*>(ModemCommandBuffer + prevModemCommandEntrySize + nextModemCommandEntrySize) = 0;
+        }
+    }
 }
 
 wchar_t lookupUnicodeForGSM(unsigned char character, bool isExtended)
@@ -779,12 +1257,32 @@ ModemResult parseResultFromModem()
 {
     char resultCode[4+1];
 
+    markReadFromModemRollback();
+
     if (readDigitsFromModem(resultCode, sizeof(resultCode)) &&
         skipCharacterFromModem('\r'))
     {
+        releaseReadFromModemRollback();
         return static_cast<ModemResult>(atoi(resultCode));
     }
 
+    if (skipCharactersFromModem(F("+CME ERROR:")) &&
+        readDigitsFromModem(resultCode, sizeof(resultCode)) &&
+        skipCharacterFromModem('\r'))
+    {
+        releaseReadFromModemRollback();
+        return static_cast<ModemResult>(atoi(resultCode) + static_cast<int>(ModemResult::CME));
+    }
+
+    if (skipCharactersFromModem(F("+CMS ERROR:")) &&
+        readDigitsFromModem(resultCode, sizeof(resultCode)) &&
+        skipCharacterFromModem('\r'))
+    {
+        releaseReadFromModemRollback();
+        return static_cast<ModemResult>(atoi(resultCode) + static_cast<int>(ModemResult::CMS));
+    }
+
+    seekReadFromModemRollback();
     return ModemResult::None;
 }
 
@@ -792,12 +1290,11 @@ ModemResult discardResponseFromModem()
 {
     for (uint8_t numResponseLines = 2; numResponseLines != 0; --numResponseLines)
     {
-        char resultCode[4+1];
+        ModemResult modemResult = parseResultFromModem();
 
-        if (readDigitsFromModem(resultCode, sizeof(resultCode)) &&
-            skipCharacterFromModem('\r'))
+        if (modemResult != ModemResult::None)
         {
-            return static_cast<ModemResult>(atoi(resultCode));
+            return modemResult;
         }
 
         discardLineFromModem();
@@ -1414,7 +1911,7 @@ size_t computeSMSPDUSize(const char* destination, size_t destinationLength, Enco
     return size;
 }
 
-bool sendSMSPDUToModem(const char* destination, size_t destinationLength, const char* message, Encoding messageEncoding, size_t messageLength)
+bool sendSMSPDUToModem(const char* destination, size_t destinationLength, const char* message, Encoding messageEncoding, uint8_t messageLength)
 {
     // Send SMSC address:
     //   byte 0: number of octets
@@ -1609,8 +2106,6 @@ bool parseFileEntryFromModem(char* fileNameBuffer, size_t fileNameBufferSize, si
         return false;
     }
 
-    skipHorizontalWhitespaceFromModem();
-
     // Read or skip file name in double quotes
     {
         if (!skipCharacterFromModem('"'))
@@ -1742,6 +2237,74 @@ void executeSerialCommandDel(const char* argumentsPtr)
     printSMSDestinations();
 }
 
+void executeSerialCommandAT(const char* command)
+{
+    struct CustomATModemCommand : ModemCommand
+    {
+        char command[32+1];
+
+        virtual bool sendCommand() override
+        {
+            // Send manual AT command to modem
+            sendCommandToModem(command, 10000);
+
+            return true;
+        }
+
+        virtual bool tryProcessResponse() override
+        {
+            while (true)
+            {
+                ModemResult modemResult = parseResultFromModem();
+    
+                if (modemResult != ModemResult::None)
+                {
+                    Serial.print(F("SMSForwarder: "));
+                    Serial.print(command);
+                    Serial.print(F(" command result: "));
+                    Serial.println(static_cast<int>(modemResult));
+                    break;
+                }
+    
+                if (isModemTimeout())
+                {
+                    Serial.print(F("SMSForwarder: "));
+                    Serial.print(command);
+                    Serial.println(F(" command timeout before receiving result code"));
+                    break;
+                }
+        
+                Serial.print(F("GSM: "));
+                discardLineFromModem(true);
+            }
+    
+            return true;
+        }
+    };
+
+    CustomATModemCommand* modemCommand = enqueueModemCommand<CustomATModemCommand>();
+
+    if (modemCommand == nullptr)
+    {
+        Serial.println(F("SMSForwarder: Cannot run custom AT command (modem command queue full)"));
+        return;
+    }
+
+    size_t commandLength = strlen(command);
+
+    if (commandLength < sizeof(modemCommand->command))
+    {
+        strcpy(modemCommand->command, command);
+
+        modemCommand->state = ModemCommandState::ReadyToSendCommand;
+        return;
+    }
+
+    Serial.println(F("SMSForwarder: Cannot run custom AT command (too long)"));
+
+    cancelModemCommand(modemCommand);
+}
+
 void printSMSDestinations()
 {
     for (uint8_t destinationIndex = 0; destinationIndex < EEPROMConfigSchema::NumDestinations; ++destinationIndex)
@@ -1787,13 +2350,30 @@ int findSMSDestination(const char* destination)
     return -1;
 }
 
-void forwardSMS(const char* sender, size_t senderLength, char* messageBuffer, size_t messageBufferSize, Encoding messageEncoding, size_t messageLength)
+bool submitSMS(const char* destination, size_t destinationLength, const char* message, Encoding messageEncoding, uint8_t messageLength)
+{
+    size_t submitPDUSize = computeSMSPDUSize(destination, destinationLength, messageEncoding, messageLength);
+
+    if (submitPDUSize > 0)
+    {
+        sendCommandToModem(F("AT+CMGS="), submitPDUSize, 120000);
+        sendSMSPDUToModem(destination, destinationLength, message, messageEncoding, messageLength);
+        return true;
+    }
+    else
+    {
+        Serial.println(F("SMSForwarder: Cannot send SMS because of invalid SMS message data"));
+        return false;
+    }
+}
+
+void appendSenderToSMSMessage(const char* sender, size_t senderLength, char* messageBuffer, size_t messageBufferSize, Encoding messageEncoding, uint8_t& messageLengthInOut)
 {
     switch (messageEncoding)
     {
         case Encoding::GSMBYTES:
         {
-            char* messageCharacterPtr = messageBuffer + messageLength;
+            char* messageCharacterPtr = messageBuffer + messageLengthInOut;
             char* messageCharacterPtrEnd = messageBuffer + messageBufferSize - 1;
 
             if (messageCharacterPtr + senderLength + 2 < messageCharacterPtrEnd)
@@ -1807,13 +2387,13 @@ void forwardSMS(const char* sender, size_t senderLength, char* messageBuffer, si
 
             *messageCharacterPtr = '\xFF';
 
-            messageLength = messageCharacterPtr - messageBuffer;
+            messageLengthInOut = messageCharacterPtr - messageBuffer;
         }
         break;
 
         case Encoding::UCS2BE:
         {
-            wchar_t* messageCodepointPtr = reinterpret_cast<wchar_t*>(messageBuffer + messageLength);
+            wchar_t* messageCodepointPtr = reinterpret_cast<wchar_t*>(messageBuffer + messageLengthInOut);
             wchar_t* messageCodepointPtrEnd = reinterpret_cast<wchar_t*>(messageBuffer + messageBufferSize) - 1;
 
             if (messageCodepointPtr + senderLength + 2 < messageCodepointPtrEnd)
@@ -1850,114 +2430,158 @@ void forwardSMS(const char* sender, size_t senderLength, char* messageBuffer, si
             
             *messageCodepointPtr = '\0';
 
-            messageLength = reinterpret_cast<char*>(messageCodepointPtr) - messageBuffer;
+            messageLengthInOut = reinterpret_cast<char*>(messageCodepointPtr) - messageBuffer;
         }
         break;
 
         default: break;
     }
+}
 
-    Serial.print(F("SMSForwarder: Outgoing SMS message: "));
-    printlnEncoded(Serial, messageBuffer, messageLength, messageEncoding);
+bool tryProcessUnsolicitedReceiveSMS()
+{
+    markReadFromModemRollback();
 
-    for (const char* destination : EEPROMConfig.destinations)
+    // Identify unsolicited result code: SMS received
+    if (skipCharactersFromModem(F("+CMT:")))
     {
-        if (destination[0] == '\0')
+        releaseReadFromModemRollback();
+    }
+    else
+    {
+        seekReadFromModemRollback();
+        return false;
+    }
+
+    // Discard trailing <alpha>,<length> fields
+    discardLineFromModem();
+
+    Serial.println(F("GSM: Received SMS"));
+
+    struct ForwardSMSModemCommand : ModemCommand
+    {
+        // Forwarded SMS message content including original sender (in GSMBYTES or UCS2BE encoding)
+        char message[160+1];
+        Encoding messageEncoding;
+        uint8_t messageLength;
+
+        // Next destination index to forward SMS to
+        uint8_t destinationIndex = 0;
+
+        virtual bool sendCommand() override
         {
-            continue;
+            const char* destination = EEPROMConfig.destinations[destinationIndex];
+
+            if (destination[0] == '\0')
+            {
+                return false;
+            }
+
+            Serial.print(F("SMSForwarder: Forwarding SMS to "));
+            Serial.println(destination);
+
+            size_t destinationLength = strlen(destination);
+            return submitSMS(destination, destinationLength, message, messageEncoding, messageLength);
         }
 
-        Serial.print(F("SMSForwarder: Forwarding to "));
-        Serial.println(destination);
-
-        size_t destinationLength = strlen(destination);
-        size_t submitPDUSize = computeSMSPDUSize(destination, destinationLength, messageEncoding, messageLength);
-
-        if (submitPDUSize > 0)
+        virtual bool tryProcessResponse() override
         {
-            sendCommandToModem(F("AT+CMGS="), submitPDUSize, 10000);
+            markReadFromModemRollback();
 
             skipEndOfLineFromModem();
             skipEndOfLineFromModem();
             skipCharacterFromModem('>');
             skipCharacterFromModem(' ');
 
-            sendSMSPDUToModem(destination, destinationLength, messageBuffer, messageEncoding, messageLength);
-        }
-        else
-        {
-            Serial.println(F("SMSForwarder: Cannot send SMS because of invalid SMS message information"));
-        }
-    }
-}
+            char messageReferenceBuffer[3+1];
+    
+            if (skipCharactersFromModem(F("+CMGS:")) &&
+                readDigitsFromModem(messageReferenceBuffer, sizeof(messageReferenceBuffer)) &&
+                skipEndOfLineFromModem())
+            {
+                releaseReadFromModemRollback();
 
-bool skipCharacterInBuffer(const char*& characterPtr, char characterToSkip)
-{
-    if (*characterPtr == characterToSkip)
-    {
-        characterPtr++;
-        return true;
-    }
+                Serial.print(F("GSM: Successfully forwarded SMS to "));
+                Serial.print(EEPROMConfig.destinations[destinationIndex]);
+                Serial.print(F(" (message reference: "));
+                Serial.print(messageReferenceBuffer);
+                Serial.println(F(")"));
+            }
+            else
+            {
+                // Roll back to start of line to parse error result
+                seekReadFromModemRollback();
+            }
+    
+            ModemResult modemResult = parseResultFromModem();
+    
+            if (modemResult == ModemResult::None)
+            {
+                return false;
+            }
 
-    return false;
-}
+            if (modemResult != ModemResult::OK)
+            {
+                Serial.print(F("GSM: Error sending SMS: "));
+                Serial.println(static_cast<int>(modemResult));
+            }
 
-template<typename char_predicate_t>
-bool skipCharactersInBuffer(const char*& characterPtr, char_predicate_t isCharacterToSkip, size_t minCharactersToSkip, size_t maxCharactersToSkip)
-{
-    const char* characterToCheckPtr = characterPtr;
-    const char* characterToCheckPtrEnd = characterPtr + maxCharactersToSkip;
-
-    while (characterToCheckPtr < characterToCheckPtrEnd && isCharacterToSkip(*characterToCheckPtr))
-    {
-        characterToCheckPtr++;
-    }
-
-    if (characterToCheckPtr >= characterPtr + minCharactersToSkip)
-    {
-        characterPtr = characterToCheckPtr;
-        return true;
-    }
-
-    return false;
-}
-
-bool skipCharactersInBuffer(const char*& characterPtr, const __FlashStringHelper* charactersToSkip)
-{
-    const char* characterToCheckPtr = characterPtr;
-
-    PGM_P characterToSkipPtr = reinterpret_cast<PGM_P>(charactersToSkip);
-
-    while (true)
-    {
-        char characterToSkip = pgm_read_byte(characterToSkipPtr++);
-
-        if (characterToSkip == '\0')
-        {
-            characterPtr = characterToCheckPtr;
             return true;
         }
 
-        if (!skipCharacterInBuffer(characterToCheckPtr, characterToSkip))
+        virtual bool advanceToNextCommand() override
         {
-            return false;
+            destinationIndex++;
+            return destinationIndex < EEPROMConfigSchema::NumDestinations;
         }
+    };
+
+    ForwardSMSModemCommand* modemCommand = enqueueModemCommand<ForwardSMSModemCommand>();
+
+    if (modemCommand == nullptr)
+    {
+        Serial.println(F("SMSForwarder: Cannot forward SMS (modem command queue full)"));
+
+        discardLineFromModem();
+        return true;
     }
-}
 
-bool isEndOfBuffer(const char* characterPtr)
-{
-    return *characterPtr == '\0';
-}
+    // Parsed message sender (always in GSMBYTES encoding)
+    char sender[17+1];
+    uint8_t senderLength;
 
-bool isNonWordCharacterInBuffer(const char* characterPtr)
-{
-    char character = *characterPtr;
+    // Parse incoming message into enqueued modem command to forward it
+    if (parseSMSPDUFromModem(
+        sender, sizeof(sender),
+        senderLength,
+        modemCommand->message, sizeof(modemCommand->message),
+        modemCommand->messageEncoding,
+        modemCommand->messageLength))
+    {
+        Serial.print(F("GSM: SMS sender: "));
+        printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
+        Serial.print(F("GSM: SMS message: "));
+        printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding);
 
-    return (character != '_') &&
-           (character < '0' || character > '9') &&
-           (character < 'A' || character > 'Z') &&
-           (character < 'a' || character > 'z');
+        appendSenderToSMSMessage(
+            sender,
+            senderLength, 
+            modemCommand->message, sizeof(modemCommand->message),
+            modemCommand->messageEncoding,
+            modemCommand->messageLength);
+        
+        Serial.print(F("SMSForwarder: Outgoing SMS message: "));
+        printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding);
+
+        modemCommand->state = ModemCommandState::ReadyToSendCommand;
+        return true;
+    }
+
+    Serial.println(F("SMSForwarder: Unable to parse SMS"));
+
+    discardLineFromModem();
+    cancelModemCommand(modemCommand);
+    return true;
 }
 
 void setup()
@@ -2205,9 +2829,7 @@ void loopSerial()
 
                     if (skipCharactersInBuffer(serialCommandCharacterPtr, F("AT")))
                     {
-                        Serial.print(F("GSM: "));
-                        Serial.println(SerialCommandBuffer);
-                        sendCommandToModem(SerialCommandBuffer, 1000);
+                        executeSerialCommandAT(SerialCommandBuffer);
                         break;
                     }
 
@@ -2235,101 +2857,76 @@ bool loopModem()
         return false;
     }
 
-    int maybeCharacter = ModemSerial.read();
+    ModemCommand* modemCommand = peekModemCommand();
 
-    if (maybeCharacter < 0)
+    // Pending modem command was abandoned before completing initialization
+    if (modemCommand != nullptr && modemCommand->state == ModemCommandState::Uninitialized)
     {
+        Serial.print(F("SMSForwarder: Discarding uninitialized modem command"));
+
+        dequeueModemCommand();
+        return true;
+    }
+
+    if (peekCharacterFromModem() == ModemSerialState::NoData)
+    {
+        // Send pending modem command
+        if (modemCommand != nullptr && modemCommand->state == ModemCommandState::ReadyToSendCommand)
+        {
+            // Send command, then wait for expected response
+            if (modemCommand->sendCommand())
+            {
+                modemCommand->state = ModemCommandState::ReadyToProcessResponse;
+                modemCommand->responseTimeoutTime = ModemTimeoutTime;
+                return true;
+            }
+            
+            // No command sent but there is more work
+            if (modemCommand->advanceToNextCommand())
+            {
+                return true;
+            }
+
+            // No command sent and there is no more work
+            dequeueModemCommand();
+            return true;
+        }
+
+        // No data available and no pending modem command
         return false;
     }
 
     startModemTimeout(1000);
 
-    if (maybeCharacter != '+')
+    // Process unsolicited result when SMS received
+    if (tryProcessUnsolicitedReceiveSMS())
     {
-        Serial.print(F("GSM: "));
-        Serial.write(maybeCharacter);
-        discardLineFromModem(true);
-
-        return false;
-    }
-
-    char resultCode[9+1];
-
-    if (readCharactersFromModemUntil(resultCode, sizeof(resultCode), ':'))
-    {
-        skipCharacterFromModem(':');
-
-        if (strcmp_P(resultCode, PSTR("CMT")) == 0)
-        {
-            Serial.println(F("GSM: Received SMS"));
-
-            skipCharactersFromModemUntil('\r');
-            skipEndOfLineFromModem();
-
-            char sender[17+1];
-            uint8_t senderLength;
-
-            char message[160+1];
-            Encoding messageEncoding;
-            uint8_t messageLength;
-
-            if (parseSMSPDUFromModem(sender, sizeof(sender), senderLength, message, sizeof(message), messageEncoding, messageLength))
-            {
-                Serial.print(F("GSM: SMS sender: "));
-                printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
-                Serial.print(F("GSM: SMS message: "));
-                printlnEncoded(Serial, message, sizeof(message), messageEncoding);
-
-                forwardSMS(sender, senderLength, message, sizeof(message), messageEncoding, messageLength);
-                return true;
-            }
-            else
-            {
-                discardLineFromModem();
-                return true;
-            }
-        }
-
-        if (strcmp_P(resultCode, PSTR("CMGS")) == 0)
-        {
-            char messageReferenceBuffer[3+1];
-
-            if (readLineFromModem(messageReferenceBuffer, sizeof(messageReferenceBuffer)))
-            {
-                Serial.print(F("GSM: Successfully sent SMS with message reference: "));
-                Serial.println(messageReferenceBuffer);
-            }
-
-            discardResponseFromModem();
-            return true;
-        }
-
-        if (strcmp_P(resultCode, PSTR("CMS ERROR")) == 0)
-        {
-            char error[10+1];
-
-            if (readCharactersFromModemUntil(error, sizeof(error), '\r'))
-            {
-                Serial.print(F("GSM: Error sending SMS: "));
-                Serial.println(error);
-            }
-            else
-            {
-                Serial.println(F("GSM: Unknown error sending SMS"));
-            }
-
-            discardResponseFromModem();
-            return true;
-        }
-
-        Serial.print(F("GSM: +"));
-        Serial.print(resultCode);
-        Serial.print(F(":"));
-        discardLineFromModem(true);
         return true;
     }
 
-    Serial.print(F("GSM: +"));
-    discardLineFromModem(true);
+    // Process expected response to current modem command
+    if (modemCommand != nullptr && modemCommand->state == ModemCommandState::ReadyToProcessResponse)
+    {
+        ModemTimeoutTime = modemCommand->responseTimeoutTime;
+
+        // Try to process the response until timeout is reached
+        if (modemCommand->tryProcessResponse() || isModemTimeout())
+        {
+            // Response processed (or timeout reached), and there is more work
+            if (modemCommand->advanceToNextCommand())
+            {
+                modemCommand->state = ModemCommandState::ReadyToSendCommand;
+                modemCommand->responseTimeoutTime = 0;
+                return true;
+            }
+
+            // Response processed and there is no more work
+            dequeueModemCommand();
+            return true;
+        }
+    }
+
+    // Data available but neither unsolicited result nor expected response
+    discardLineFromModem();
     return false;
 }
