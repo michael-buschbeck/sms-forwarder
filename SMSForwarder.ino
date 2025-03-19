@@ -2163,9 +2163,32 @@ bool parseFileEntryFromModem(char* fileNameBuffer, size_t fileNameBufferSize, si
     return true;
 }
 
+unsigned long SerialCommandHelpTime = 0;
+
+void delaySerialCommandHelp(unsigned long delay)
+{
+    SerialCommandHelpTime = millis() + delay;
+}
+
 void printSerialCommandHelp()
 {
     Serial.println(F("SMSForwarder: Enter command via serial interface: list, add +491701234567, del +491701234567, voice +491701234567"));
+}
+
+void printSerialCommandHelpWithDelay()
+{
+    if (SerialCommandHelpTime == static_cast<unsigned long>(-1))
+    {
+        return;
+    }
+
+    signed long remainingMillis = static_cast<signed long>(SerialCommandHelpTime - millis());
+
+    if (remainingMillis < 0)
+    {
+        printSerialCommandHelp();
+        SerialCommandHelpTime = static_cast<unsigned long>(-1);
+    }
 }
 
 void executeSerialCommandAdd(const char* argumentsPtr)
@@ -2713,38 +2736,43 @@ void setupModem()
 
         case ModemRuntimeState::Active:
             Serial.println(F("GSM: Startup complete"));
-            printSerialCommandHelp();
             break;
     }
 }
 
 void loop()
 {
-    if (loopModem())
-    {
-        printSerialCommandHelp();
-    }
+    printSerialCommandHelpWithDelay();
 
-    loopSerial();
+    bool isActive;
+
+    isActive = loopModem();
+    isActive = loopSerial() || isActive;
+
+    if (isActive)
+    {
+        // Print serial command help with delay after activity
+        delaySerialCommandHelp(10000);
+    }
 }
 
 char SerialCommandBuffer[32+1];
 uint8_t SerialCommandLength = 0;
 
-void loopSerial()
+bool loopSerial()
 {
     int maybeCharacter = Serial.read();
 
     if (maybeCharacter < 0)
     {
-        return;
+        return false;
     }
 
     char character = static_cast<char>(maybeCharacter);
 
     if (isHorizontalWhitespace(character) && (SerialCommandLength == 0 || isHorizontalWhitespace(SerialCommandBuffer[SerialCommandLength - 1])))
     {
-        return;
+        return false;
     }
 
     if (character == '\r' ||
@@ -2752,7 +2780,7 @@ void loopSerial()
     {
         if (SerialCommandLength == 0)
         {
-            return;
+            return false;
         }
 
         if (isHorizontalWhitespace(SerialCommandBuffer[SerialCommandLength - 1]))
@@ -2841,13 +2869,15 @@ void loopSerial()
             SerialCommandLength = 0;
         }
 
-        return;
+        return true;
     }
 
     if (SerialCommandLength < sizeof(SerialCommandBuffer) - 1)
     {
         SerialCommandBuffer[SerialCommandLength++] = character;
     }
+
+    return false;
 }
 
 bool loopModem()
