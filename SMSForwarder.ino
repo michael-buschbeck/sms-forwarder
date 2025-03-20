@@ -11,7 +11,38 @@
 #include <Arduino.h>
 #include <EEPROM.h>
 #include <SoftwareSerial.h>
+
+// for placement new
 #include <new>
+
+// for perfect forwarding
+namespace std
+{
+    template <typename T>
+    struct remove_reference {
+        using type = T;
+    };
+    
+    template <typename T>
+    struct remove_reference<T&> {
+        using type = T;
+    };
+    
+    template <typename T>
+    struct remove_reference<T&&> {
+        using type = T;
+    };
+    
+    template <typename T>
+    T&& forward(typename remove_reference<T>::type& t) {
+        return static_cast<T&&>(t);
+    }
+    
+    template <typename T>
+    T&& forward(typename remove_reference<T>::type&& t) {
+        return static_cast<T&&>(t);
+    }
+}
 
 #define MODEM_SERIAL_RX_PIN 2
 #define MODEM_SERIAL_TX_PIN 3
@@ -50,6 +81,13 @@ struct EEPROMConfigSchema
 };
 
 EEPROMConfigSchema EEPROMConfig;
+
+struct DestinationState
+{
+    bool interactionInProgress = false;
+};
+
+DestinationState DestinationStates[EEPROMConfigSchema::NumDestinations];
 
 struct ModemSerialState
 {
@@ -434,11 +472,62 @@ const Mapping<char, wchar_t> GSMToUnicodeExtension[] PROGMEM =
     { /*GSM 0x1B,*/ 0x65, /*Unicode*/ 0x20AC },
 };
 
-SoftwareSerial ModemSerial(MODEM_SERIAL_RX_PIN, MODEM_SERIAL_TX_PIN);
-
-bool skipCharacterInBuffer(const char*& characterPtr, char characterToSkip)
+class BufferPrint : public Print
 {
-    if (*characterPtr == characterToSkip)
+public:
+    BufferPrint(uint8_t* buffer, size_t bufferSize)
+        : bufferPtr(buffer)
+        , bufferPtrEnd(buffer + bufferSize) {}
+    
+    BufferPrint(char* buffer, size_t bufferSize)
+        : bufferPtr(reinterpret_cast<uint8_t*>(buffer))
+        , bufferPtrEnd(reinterpret_cast<uint8_t*>(buffer + bufferSize - 1))
+    {
+        memset(buffer, '\0', bufferSize);
+    }
+
+    virtual size_t write(uint8_t octet) override
+    {
+        if (bufferPtr < bufferPtrEnd)
+        {
+            *bufferPtr++ = octet;
+            return sizeof(uint8_t);
+        }
+
+        return 0;
+    }
+
+    virtual size_t write(const uint8_t* source, size_t sourceLength) override
+    {
+        size_t writeLength = bufferPtrEnd - bufferPtr;
+
+        if (sourceLength < writeLength)
+        {
+            writeLength = sourceLength;
+        }
+
+        memcpy(bufferPtr, source, writeLength);
+        bufferPtr += writeLength;
+
+        return writeLength;
+    }
+
+private:
+    uint8_t* bufferPtr;
+    uint8_t* bufferPtrEnd;
+};
+
+bool skipCharacterInBuffer(const char*& characterPtr, char characterToSkip, bool caseSensitive = true)
+{
+    char characterToCompare = *characterPtr;
+
+    if (!caseSensitive && (characterToSkip >= 'a' && characterToSkip <= 'z'))
+    {
+        characterToSkip    &= ~('A' ^ 'a');
+        characterToCompare &= ~('A' ^ 'a');
+    }
+
+    if (characterToCompare == characterToSkip)
     {
         characterPtr++;
         return true;
@@ -467,7 +556,7 @@ bool skipCharactersInBuffer(const char*& characterPtr, char_predicate_t isCharac
     return false;
 }
 
-bool skipCharactersInBuffer(const char*& characterPtr, const __FlashStringHelper* charactersToSkip)
+bool skipCharactersInBuffer(const char*& characterPtr, const __FlashStringHelper* charactersToSkip, bool caseSensitive = true)
 {
     const char* characterToCheckPtr = characterPtr;
 
@@ -483,11 +572,28 @@ bool skipCharactersInBuffer(const char*& characterPtr, const __FlashStringHelper
             return true;
         }
 
-        if (!skipCharacterInBuffer(characterToCheckPtr, characterToSkip))
+        if (!skipCharacterInBuffer(characterToCheckPtr, characterToSkip, caseSensitive))
         {
             return false;
         }
     }
+}
+
+bool isHorizontalWhitespace(char character)
+{
+    return (character == '\t') ||
+           (character == ' ');
+}
+
+bool skipHorizontalWhitespaceInBuffer(const char*& characterPtr, size_t minWhitespaceToSkip = 0, size_t maxWhitespaceToSkip = 255)
+{
+    return skipCharactersInBuffer(characterPtr, isHorizontalWhitespace, minWhitespaceToSkip, maxWhitespaceToSkip);
+}
+
+bool skipHorizontalWhitespaceInBuffer(const char*& characterPtr, const char* characterPtrEnd, size_t minWhitespaceToSkip = 0)
+{
+    size_t maxWhitespaceToSkip = characterPtrEnd - characterPtr;
+    return skipHorizontalWhitespaceInBuffer(characterPtr, minWhitespaceToSkip, maxWhitespaceToSkip);
 }
 
 bool isEndOfBuffer(const char* characterPtr)
@@ -640,6 +746,8 @@ void fakeReadFromModemRollback(const __FlashStringHelper* string)
     ModemReadRollbackReadLength = rollbackPtr - ModemReadRollbackBuffer;
     ModemReadRollbackReadOffset = 0;
 }
+
+SoftwareSerial ModemSerial(MODEM_SERIAL_RX_PIN, MODEM_SERIAL_TX_PIN);
 
 int peekCharacterFromModem()
 {
@@ -876,12 +984,6 @@ size_t readDigitsFromModem(char* buffer, size_t bufferSize)
     return readCharactersFromModemWhile(buffer, bufferSize, isDecDigit);
 }
 
-bool isHorizontalWhitespace(char character)
-{
-    return (character == '\t') ||
-           (character == ' ');
-}
-
 void skipHorizontalWhitespaceFromModem()
 {
     skipCharactersFromModemWhile(isHorizontalWhitespace);
@@ -956,8 +1058,8 @@ void* allocateModemCommand(size_t modemCommandSize)
     return modemCommandEntryPtr + sizeof(size_t);
 }
 
-template<typename modem_command_t>
-modem_command_t* enqueueModemCommand()
+template<typename modem_command_t, typename... args_t>
+modem_command_t* enqueueModemCommand(args_t&&... args)
 {
     void* modemCommandPtr = allocateModemCommand(sizeof(modem_command_t));
 
@@ -966,7 +1068,7 @@ modem_command_t* enqueueModemCommand()
         return nullptr;
     }
 
-    return new(modemCommandPtr) modem_command_t;
+    return new(modemCommandPtr) modem_command_t(std::forward<args_t>(args)...);
 }
 
 ModemCommand* peekModemCommand()
@@ -1475,66 +1577,94 @@ bool setupReceiveSMS()
     return true;
 }
 
-void queryCallForwardingAsync(void (*callback)(ModemResult modemResult, const char* forwardingNumber))
+void sendQueryCallForwardingCommand()
+{
+    // Query call forwarding
+    //   <reads>=0: unconditional forwarding
+    //   <mode>=2: query
+    //   <number>
+    //   <type>
+    //   <class>=1: voice calls
+    sendCommandToModem(F("AT+CCFC=0,2,,,1"), 10000);
+}
+
+bool parseQueryCallForwardingResponse(char* destinationBuffer, size_t destinationBufferSize)
+{
+    destinationBuffer[0] = '\0';
+
+    bool gotResponse = false;
+    
+    while (true)
+    {
+        markReadFromModemRollback();
+
+        char forwardingStatus[1+1];
+        char forwardingClass[2+1];
+
+        if (skipCharactersFromModem(F("+CCFC:")) &&
+            readDigitsFromModem(forwardingStatus, sizeof(forwardingStatus)) &&
+            skipCharacterFromModem(',') &&
+            readDigitsFromModem(forwardingClass, sizeof(forwardingClass)))
+        {
+            releaseReadFromModemRollback();
+
+            // Read call forwarding destination if enabled for voice calls
+            if (forwardingStatus[0] == '1' &&
+                forwardingClass[0] == '1' &&
+                skipCharacterFromModem(',') &&
+                skipCharacterFromModem('"') &&
+                readCharactersFromModemUntil(destinationBuffer, destinationBufferSize, '"') &&
+                skipCharacterFromModem('"'))
+            {
+                // Parsed call forwarding destination successfully
+            }
+
+            gotResponse = true;
+
+            // Skip remaining fields including end-of-line
+            discardLineFromModem();
+        }
+        else
+        {
+            // Roll back to start of line
+            seekReadFromModemRollback();
+
+            break;
+        }
+    }
+
+    return gotResponse;
+}
+
+void queryCallForwardingAsync(void (*callback)(ModemResult modemResult, const char* destination))
 {
     struct QueryCallForwardingModemCommand : ModemCommand
     {
-        void (*callback)(ModemResult modemResult, const char* forwardingNumber);
+        // Callback after the call forwarding disable request has completed
+        // - Can be nullptr if no callback is needed
+        // - Executed both on success or failure, indicated through modemResult
+        // - When called on failure, destination is nullptr
+        void (*callback)(ModemResult modemResult, const char* destination);
 
         virtual bool sendCommand() override
         {
-            // Query call forwarding
-            //   <reads>=0: unconditional forwarding
-            //   <mode>=2: query
-            //   <number>
-            //   <type>
-            //   <class>=1: voice calls
-            sendCommandToModem(F("AT+CCFC=0,2,,,1"), 10000);
-            
+            sendQueryCallForwardingCommand();
+
             return true;
         }
 
         virtual bool tryProcessResponse() override
         {
-            bool gotForwardingNumber = false;
+            char destination[17+1];
 
-            char forwardingNumber[17+1];
-
-            while (true)
+            if (parseQueryCallForwardingResponse(destination, sizeof(destination)))
             {
-                markReadFromModemRollback();
-
-                char forwardingStatus[1+1];
-                char forwardingClass[2+1];
-
-                if (skipCharactersFromModem(F("+CCFC:")) &&
-                    readDigitsFromModem(forwardingStatus, sizeof(forwardingStatus)) &&
-                    skipCharacterFromModem(',') &&
-                    readDigitsFromModem(forwardingClass, sizeof(forwardingClass)))
-                {
-                    releaseReadFromModemRollback();
-
-                    // Read forwarding number if enabled for voice calls
-                    if (forwardingStatus[0] == '1' &&
-                        forwardingClass[0] == '1' &&
-                        skipCharacterFromModem(',') &&
-                        skipCharacterFromModem('"') &&
-                        readCharactersFromModemUntil(forwardingNumber, sizeof(forwardingNumber), '"') &&
-                        skipCharacterFromModem('"'))
-                    {
-                        gotForwardingNumber = true;
-                    }
-
-                    // Skip remaining fields including end-of-line
-                    discardLineFromModem();
-                }
-                else
-                {
-                    // Roll back to start of line to parse result
-                    seekReadFromModemRollback();
-
-                    break;
-                }
+                // Parsed call forwarding destination successfully
+            }
+            else
+            {
+                // Not the expected response
+                return false;
             }
 
             ModemResult modemResult = parseResultFromModem();
@@ -1546,7 +1676,8 @@ void queryCallForwardingAsync(void (*callback)(ModemResult modemResult, const ch
 
             if (callback != nullptr)
             {
-                callback(modemResult, gotForwardingNumber ? forwardingNumber : nullptr);
+                bool hasDestination = destination[0] != '\0';
+                callback(modemResult, hasDestination ? destination : nullptr);
             }
 
             return true;
@@ -1565,21 +1696,29 @@ void queryCallForwardingAsync(void (*callback)(ModemResult modemResult, const ch
     modemCommand->state = ModemCommandState::ReadyToSendCommand;
 }
 
+void sendDisableCallForwardingCommand()
+{
+    // Disable call forwarding
+    //   <reads>=0: unconditional forwarding
+    //   <mode>=4: erasure
+    //   <number>
+    //   <type>
+    //   <class>=1: voice calls
+    sendCommandToModem(F("AT+CCFC=0,4,,,1"), 10000);
+}
+
 void disableCallForwardingAsync(void (*callback)(ModemResult modemResult))
 {
     struct DisableCallForwardingModemCommand : ModemCommand
     {
+        // Callback after the call forwarding disable request has completed
+        // - Can be nullptr if no callback is needed
+        // - Executed both on success or failure, indicated through modemResult
         void (*callback)(ModemResult modemResult);
 
         virtual bool sendCommand() override
         {
-            // Disable call forwarding
-            //   <reads>=0: unconditional forwarding
-            //   <mode>=4: erasure
-            //   <number>
-            //   <type>
-            //   <class>=1: voice calls
-            sendCommandToModem(F("AT+CCFC=0,4,,,1"), 10000);
+            sendDisableCallForwardingCommand();
 
             return true;
         }
@@ -1614,23 +1753,33 @@ void disableCallForwardingAsync(void (*callback)(ModemResult modemResult))
     modemCommand->state = ModemCommandState::ReadyToSendCommand;
 }
 
-void updateCallForwardingAsync(const char* forwardingNumber, void (*callback)(ModemResult modemResult, const char* forwardingNumber))
+void sendUpdateCallForwardingCommand(const char* destination)
+{
+    // Enable call forwarding
+    //   <reads>=0: unconditional forwarding
+    //   <mode>=3: registration
+    //   <number>: forwarding number
+    //   <type>=145: international number
+    //   <class>=1: voice calls
+    sendCommandToModem(F("AT+CCFC=0,3,"), destination, F(",145,1"), 10000);
+}
+
+void updateCallForwardingAsync(const char* destination, void (*callback)(ModemResult modemResult, const char* destination))
 {
     struct UpdateCallForwardingModemCommand : ModemCommand
     {
-        void (*callback)(ModemResult modemResult, const char* forwardingNumber);
+        // Callback after the call forwarding update request has completed
+        // - Can be nullptr if no callback is needed
+        // - Executed both on success or failure, indicated through modemResult
+        // - When called on failure, destination is nullptr
+        void (*callback)(ModemResult modemResult, const char* destination);
 
-        char forwardingNumber[17+1];
+        // Requested updated call forwarding number
+        char destination[17+1];
 
         virtual bool sendCommand() override
         {
-            // Enable call forwarding
-            //   <reads>=0: unconditional forwarding
-            //   <mode>=3: registration
-            //   <number>: forwarding number
-            //   <type>=145: international number
-            //   <class>=1: voice calls
-            sendCommandToModem(F("AT+CCFC=0,3,"), forwardingNumber, F(",145,1"), 10000);
+            sendUpdateCallForwardingCommand(destination);
 
             return true;
         }
@@ -1646,7 +1795,7 @@ void updateCallForwardingAsync(const char* forwardingNumber, void (*callback)(Mo
 
             if (callback != nullptr)
             {
-                callback(modemResult, modemResult == ModemResult::OK ? forwardingNumber : nullptr);
+                callback(modemResult, modemResult == ModemResult::OK ? destination : nullptr);
             }
 
             return true;
@@ -1661,9 +1810,9 @@ void updateCallForwardingAsync(const char* forwardingNumber, void (*callback)(Mo
         return;
     }
 
-    size_t forwardingNumberLength = strlen(forwardingNumber);
+    size_t destinationLength = strlen(destination);
 
-    if (forwardingNumberLength >= sizeof(modemCommand->forwardingNumber))
+    if (destinationLength >= sizeof(modemCommand->destination))
     {
         cancelModemCommand(modemCommand);
 
@@ -1671,7 +1820,7 @@ void updateCallForwardingAsync(const char* forwardingNumber, void (*callback)(Mo
         return;
     }
 
-    strcpy(modemCommand->forwardingNumber, forwardingNumber);
+    strcpy(modemCommand->destination, destination);
 
     modemCommand->callback = callback;
     modemCommand->state = ModemCommandState::ReadyToSendCommand;
@@ -1825,14 +1974,10 @@ void sendGSMAlphaToModem(const char* characters, uint8_t charactersToWrite)
     }
 }
 
-bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& senderLengthOut, char* messageBuffer, size_t messageBufferSize, Encoding& messageEncodingOut, uint8_t& messageLengthOut)
+bool parseSMSPDUHeaderFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& senderLengthOut, bool& hasUserDataHeaderOut)
 {
     senderBuffer[0] = '\xFF';
     senderLengthOut = 0;
-
-    messageBuffer[0] = '\xFF';
-    messageEncodingOut = Encoding::Unknown;
-    messageLengthOut = 0;
 
     // Skip SMSC address:
     //   byte  0:    number of octets
@@ -1846,7 +1991,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
         }
     }
 
-    bool hasUserDataHeader = false;
+    hasUserDataHeaderOut = false;
 
     // Read message header:
     //   bits 0..1: TP-MTI  (message type indicator)
@@ -1868,7 +2013,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
             return false;
         }
 
-        hasUserDataHeader = (header & TP_UDHI_MASK) == TP_UDHI_PRESENT;
+        hasUserDataHeaderOut = (header & TP_UDHI_MASK) == TP_UDHI_PRESENT;
     }
 
     // Read TP-OA (originating address):
@@ -1987,6 +2132,15 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
         }
     }
 
+    return !isModemTimeout();
+}
+
+bool parseSMSPDUBodyFromModem(bool hasUserDataHeader, char* messageBuffer, size_t messageBufferSize, Encoding& messageEncodingOut, uint8_t& messageLengthOut)
+{
+    messageBuffer[0] = '\xFF';
+    messageEncodingOut = Encoding::Unknown;
+    messageLengthOut = 0;
+
     uint8_t messageCoding;
 
     const uint8_t TP_DCS_GSM7BIT = 0x00;
@@ -2018,7 +2172,7 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
         }
     }
 
-    // Read message:
+    // Read message header:
     //   byte  0:    TP-UDL (user data length)
     //   bytes 1..n: TP-UD  (user data)
     {
@@ -2095,6 +2249,14 @@ bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& 
     }
 
     return !isModemTimeout();
+}
+
+bool parseSMSPDUFromModem(char* senderBuffer, size_t senderBufferSize, uint8_t& senderLengthOut, char* messageBuffer, size_t messageBufferSize, Encoding& messageEncodingOut, uint8_t& messageLengthOut)
+{
+    bool hasUserDataHeader;
+    
+    return parseSMSPDUHeaderFromModem(senderBuffer, senderBufferSize, senderLengthOut, hasUserDataHeader) &&
+           parseSMSPDUBodyFromModem(hasUserDataHeader, messageBuffer, messageBufferSize, messageEncodingOut, messageLengthOut);
 }
 
 size_t computeSMSPDUSize(const char* destination, size_t destinationLength, Encoding messageEncoding, size_t messageLength)
@@ -2482,7 +2644,7 @@ void executeSerialCommandAdd(const char* argumentsPtr)
             return;
         }
 
-        memset(EEPROMConfig.destinations[emptyDestinationIndex], 0, sizeof(EEPROMConfig.destinations[emptyDestinationIndex]));
+        memset(EEPROMConfig.destinations[emptyDestinationIndex], '\0', sizeof(EEPROMConfig.destinations[emptyDestinationIndex]));
         strcpy(EEPROMConfig.destinations[emptyDestinationIndex], destinationPtr);
 
         EEPROM.put(0, EEPROMConfig);
@@ -2512,9 +2674,12 @@ void executeSerialCommandDel(const char* argumentsPtr)
         return;
     }
 
-    memset(EEPROMConfig.destinations[destinationIndex], 0, sizeof(EEPROMConfig.destinations[destinationIndex]));
+    memset(EEPROMConfig.destinations[destinationIndex], '\0', sizeof(EEPROMConfig.destinations[destinationIndex]));
 
     EEPROM.put(0, EEPROMConfig);
+
+    // Reset destination runtime state
+    DestinationStates[destinationIndex] = DestinationState();
 
     Serial.print(F("SMSForwarder: Deleted destination phone number from slot "));
     Serial.println(destinationIndex);
@@ -2526,18 +2691,18 @@ void executeSerialCommandVoice(const char* argumentsPtr)
 {
     if (isEndOfBuffer(argumentsPtr))
     {
-        queryCallForwardingAsync([](ModemResult modemResult, const char* forwardingNumber)
+        queryCallForwardingAsync([](ModemResult modemResult, const char* destination)
         {
             if (modemResult == ModemResult::OK)
             {
-                if (forwardingNumber == nullptr)
+                if (destination == nullptr)
                 {
                     Serial.println(F("GSM: Voice call fowarding disabled"));
                 }
                 else
                 {
                     Serial.print(F("GSM: Voice call forwarding to "));
-                    Serial.println(forwardingNumber);
+                    Serial.println(destination);
                 }
             }
             else
@@ -2571,18 +2736,18 @@ void executeSerialCommandVoice(const char* argumentsPtr)
         return;
     }
 
-    const char* parseForwardingNumberPtr = argumentsPtr;
+    const char* parseDestinationPtr = argumentsPtr;
 
-    if (skipCharacterInBuffer(parseForwardingNumberPtr, '+') &&
-        skipCharactersInBuffer(parseForwardingNumberPtr, isDecDigit, 7, 17) &&
-        isEndOfBuffer(parseForwardingNumberPtr))
+    if (skipCharacterInBuffer(parseDestinationPtr, '+') &&
+        skipCharactersInBuffer(parseDestinationPtr, isDecDigit, 7, 17) &&
+        isEndOfBuffer(parseDestinationPtr))
     {
-        updateCallForwardingAsync(argumentsPtr, [](ModemResult modemResult, const char* forwardingNumber)
+        updateCallForwardingAsync(argumentsPtr, [](ModemResult modemResult, const char* destination)
         {
             if (modemResult == ModemResult::OK)
             {
                 Serial.print(F("GSM: Successfully enabled voice call forwarding to "));
-                Serial.println(forwardingNumber);
+                Serial.println(destination);
             }
             else
             {
@@ -2601,6 +2766,7 @@ void executeSerialCommandAT(const char* command)
 {
     struct CustomATModemCommand : ModemCommand
     {
+        // Custom modem command to execute
         char command[48+1];
 
         virtual bool sendCommand() override
@@ -2701,16 +2867,32 @@ int findSMSDestination(const char* destination)
 {
     for (uint8_t destinationIndex = 0; destinationIndex < EEPROMConfigSchema::NumDestinations; ++destinationIndex)
     {
-        if (strcmp(EEPROMConfig.destinations[destinationIndex], destination) == 0)
+        const char* characterPtrA = EEPROMConfig.destinations[destinationIndex];
+        const char* characterPtrB = destination;
+
+        while (true)
         {
-            return destinationIndex;
+            char characterA = *characterPtrA++;
+            char characterB = *characterPtrB++;
+
+            // Support comparing null-terminated and GSMBYTES-terminated strings
+            if ((characterA == '\0' || characterA == '\xFF') &&
+                (characterB == '\0' || characterB == '\xFF'))
+            {
+                return destinationIndex;
+            }
+
+            if (characterA != characterB)
+            {
+                break;
+            }
         }
     }
 
     return -1;
 }
 
-bool submitSMS(const char* destination, size_t destinationLength, const char* message, Encoding messageEncoding, uint8_t messageLength)
+bool sendSubmitSMSCommand(const char* destination, size_t destinationLength, const char* message, Encoding messageEncoding, uint8_t messageLength)
 {
     size_t submitPDUSize = computeSMSPDUSize(destination, destinationLength, messageEncoding, messageLength);
 
@@ -2724,6 +2906,8 @@ bool submitSMS(const char* destination, size_t destinationLength, const char* me
         printlnEncoded(Serial, destination, destinationLength, Encoding::GSMBYTES, true);
         Serial.print(F("SMSForwarder DEBUG: SMS message: "));
         printlnEncoded(Serial, message, messageLength, messageEncoding, true);
+        Serial.print(F("SMSForwarder DEBUG: SMS message length: "));
+        Serial.println(messageLength);
         fakeReadFromModemRollback(F("+CMGS: 255\r0\r"));
         //*/
         return true;
@@ -2731,6 +2915,29 @@ bool submitSMS(const char* destination, size_t destinationLength, const char* me
     else
     {
         Serial.println(F("SMSForwarder: Cannot send SMS because of invalid SMS message data"));
+        return false;
+    }
+}
+
+bool parseSubmitSMSResponse(char* messageReferenceBuffer, size_t messageReferenceBufferSize)
+{
+    markReadFromModemRollback();
+    
+    skipEndOfLineFromModem();
+    skipEndOfLineFromModem();
+    skipCharacterFromModem('>');
+    skipCharacterFromModem(' ');
+
+    if (skipCharactersFromModem(F("+CMGS:")) &&
+        readDigitsFromModem(messageReferenceBuffer, messageReferenceBufferSize) &&
+        skipEndOfLineFromModem())
+    {
+        releaseReadFromModemRollback();
+        return true;
+    }
+    else
+    {
+        seekReadFromModemRollback();
         return false;
     }
 }
@@ -2826,111 +3033,587 @@ bool tryProcessUnsolicitedReceiveSMS()
 
     Serial.println(F("GSM: Received SMS"));
 
-    struct ForwardSMSModemCommand : ModemCommand
-    {
-        // Forwarded SMS message content including original sender (in GSMBYTES or UCS2BE encoding)
-        char message[160+1];
-        Encoding messageEncoding;
-        uint8_t messageLength;
-
-        // Next destination index to forward SMS to
-        uint8_t destinationIndex = 0;
-
-        virtual bool sendCommand() override
-        {
-            const char* destination = EEPROMConfig.destinations[destinationIndex];
-
-            if (destination[0] == '\0')
-            {
-                return false;
-            }
-
-            Serial.print(F("SMSForwarder: Forwarding SMS to "));
-            Serial.println(destination);
-
-            size_t destinationLength = strlen(destination);
-            return submitSMS(destination, destinationLength, message, messageEncoding, messageLength);
-        }
-
-        virtual bool tryProcessResponse() override
-        {
-            markReadFromModemRollback();
-
-            skipEndOfLineFromModem();
-            skipEndOfLineFromModem();
-            skipCharacterFromModem('>');
-            skipCharacterFromModem(' ');
-
-            char messageReferenceBuffer[3+1];
-    
-            if (skipCharactersFromModem(F("+CMGS:")) &&
-                readDigitsFromModem(messageReferenceBuffer, sizeof(messageReferenceBuffer)) &&
-                skipEndOfLineFromModem())
-            {
-                releaseReadFromModemRollback();
-
-                Serial.print(F("GSM: Successfully forwarded SMS to "));
-                Serial.print(EEPROMConfig.destinations[destinationIndex]);
-                Serial.print(F(" (message reference: "));
-                Serial.print(messageReferenceBuffer);
-                Serial.println(F(")"));
-            }
-            else
-            {
-                // Roll back to start of line to parse error result
-                seekReadFromModemRollback();
-            }
-    
-            ModemResult modemResult = parseResultFromModem();
-    
-            if (modemResult == ModemResult::None)
-            {
-                return false;
-            }
-
-            if (modemResult != ModemResult::OK)
-            {
-                Serial.print(F("GSM: Error sending SMS: "));
-                Serial.println(static_cast<int>(modemResult));
-            }
-
-            return true;
-        }
-
-        virtual bool advanceToNextCommand() override
-        {
-            destinationIndex++;
-            return destinationIndex < EEPROMConfigSchema::NumDestinations;
-        }
-    };
-
-    ForwardSMSModemCommand* modemCommand = enqueueModemCommand<ForwardSMSModemCommand>();
-
-    if (modemCommand == nullptr)
-    {
-        discardLineFromModem();
-
-        Serial.println(F("SMSForwarder: Cannot forward SMS (modem command queue full)"));
-        return true;
-    }
-
     // Parsed message sender (always in GSMBYTES encoding)
     char sender[17+1];
     uint8_t senderLength;
 
-    // Parse incoming message into enqueued modem command to forward it
-    if (parseSMSPDUFromModem(
+    // User data header present before message body?
+    bool hasUserDataHeader;
+
+    if (parseSMSPDUHeaderFromModem(
         sender, sizeof(sender),
         senderLength,
-        modemCommand->message, sizeof(modemCommand->message),
-        modemCommand->messageEncoding,
-        modemCommand->messageLength))
+        hasUserDataHeader))
     {
-        Serial.print(F("GSM: SMS sender: "));
-        printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
-        Serial.print(F("GSM: SMS message: "));
-        printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding, true);
+        // Parsed SMS header
+    }
+    else
+    {
+        discardLineFromModem();
+    
+        Serial.println(F("SMSForwarder: Unable to parse SMS header"));
+        return true;
+    }
 
+    int destinationIndex = findSMSDestination(sender);
+
+    if (destinationIndex >= 0)
+    {
+        Serial.print(F("SMSForwarder: Privileged SMS sender: "));
+        printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
+
+        // Privileged command in SMS message
+        char message[32+1];
+        Encoding messageEncoding;
+        uint8_t messageLength;
+
+        // Parse incoming message into enqueued modem command to forward it
+        if (parseSMSPDUBodyFromModem(
+            hasUserDataHeader,
+            message, sizeof(message),
+            messageEncoding,
+            messageLength))
+        {
+            // Parsed SMS message successfully
+        }
+        else
+        {
+            discardLineFromModem();
+        
+            Serial.println(F("SMSForwarder: Unable to parse privileged SMS body"));
+            return true;
+        }
+
+        Serial.print(F("SMSForwarder: Privileged SMS message: "));
+        printlnEncoded(Serial, message, messageLength, messageEncoding, true);
+
+        const char* parseMessagePtr = message;
+        const char* parseMessagePtrEnd = message + sizeof(message);
+
+        if (skipHorizontalWhitespaceInBuffer(parseMessagePtr, parseMessagePtrEnd) &&
+            skipCharactersInBuffer(parseMessagePtr, F("Anrufe"), false) &&
+            skipHorizontalWhitespaceInBuffer(parseMessagePtr, parseMessagePtrEnd, 1) &&
+            skipCharactersInBuffer(parseMessagePtr, F("an"), false) &&
+            skipHorizontalWhitespaceInBuffer(parseMessagePtr, parseMessagePtrEnd, 1) &&
+            skipCharactersInBuffer(parseMessagePtr, F("mich"), false) &&
+            skipHorizontalWhitespaceInBuffer(parseMessagePtr, parseMessagePtrEnd) &&
+            skipCharacterInBuffer(parseMessagePtr, '\xFF'))
+        {
+            Serial.print(F("SMSForwarder: Privileged SMS requests voice call forwarding to "));
+            Serial.println(EEPROMConfig.destinations[destinationIndex]);
+
+            if (DestinationStates[destinationIndex].interactionInProgress)
+            {
+                Serial.println(F("SMSForwarder: Ignoring privileged SMS request because a prior interaction is already in progress"));
+                return true;
+            }
+
+            struct UpdateCallForwardingSMSModemCommand : ModemCommand
+            {
+                // Telephone number of the requestor and requested updated call forwarding number
+                char destination[17+1];
+
+                // Destination index for broadcasted confirmation SMS after call forwarding change
+                uint8_t messageDestinationIndex;
+
+                enum struct Step : uint8_t
+                {
+                    UpdateCallForwarding,
+                    SendSuccessMessage,
+                    SendFailureMessage,
+                    Done,
+
+                    ErrorUpdateCallForwarding,
+                };
+
+                Step step = Step::UpdateCallForwarding;
+
+                UpdateCallForwardingSMSModemCommand(uint8_t destinationIndex)
+                {
+                    strcpy(destination, EEPROMConfig.destinations[destinationIndex]);
+                    DestinationStates[destinationIndex].interactionInProgress = true;
+
+                    messageDestinationIndex = 0;
+                }
+
+                virtual ~UpdateCallForwardingSMSModemCommand() override
+                {
+                    int destinationIndex = findSMSDestination(destination);
+                    if (destinationIndex >= 0)
+                    {
+                        DestinationStates[destinationIndex].interactionInProgress = false;
+                    }
+                }
+
+                virtual bool sendCommand() override
+                {
+                    switch (step)
+                    {
+                        case Step::UpdateCallForwarding:
+                        {
+                            sendUpdateCallForwardingCommand(destination);
+                        }
+                        return true;
+
+                        case Step::SendSuccessMessage:
+                        case Step::SendFailureMessage:
+                        {
+                            const char* messageDestination;
+                            char message[64+1];
+
+                            BufferPrint messagePrint(message, sizeof(message));
+
+                            if (step == Step::SendSuccessMessage)
+                            {
+                                messageDestination = EEPROMConfig.destinations[messageDestinationIndex];
+
+                                if (messageDestination[0] == '\0')
+                                {
+                                    return false;
+                                }
+
+                                if (strcmp(messageDestination, destination) == 0)
+                                {
+                                    messagePrint.print(F("Anrufe werden jetzt an dich weitergeleitet."));
+                                }
+                                else
+                                {
+                                    messagePrint.print(F("Anrufe werden jetzt an "));
+                                    messagePrint.print(destination);
+                                    messagePrint.print(F(" weitergeleitet."));
+                                }
+                            }
+                            else
+                            {
+                                messageDestination = destination;
+
+                                messagePrint.print(F("Anrufweiterleitung konnte nicht angepasst werden."));
+                            }
+
+                            size_t messageDestinationLength = strlen(messageDestination);
+                            size_t messageLength = strlen(message);
+                            return sendSubmitSMSCommand(messageDestination, messageDestinationLength, message, Encoding::GSMBYTES, messageLength);
+                        }
+
+                        default: break;
+                    }
+
+                    return false;
+                }
+
+                virtual bool tryProcessResponse() override
+                {
+                    switch (step)
+                    {
+                        case Step::UpdateCallForwarding:
+                        {
+                            ModemResult modemResult = parseResultFromModem();
+
+                            if (modemResult == ModemResult::None)
+                            {
+                                return false;
+                            }
+
+                            if (modemResult == ModemResult::OK)
+                            {
+                                Serial.print(F("SMSForwarder: Updated voice call forwarding for privileged SMS call forwarding update request to "));
+                                Serial.println(destination);
+                            }
+                            else
+                            {
+                                step = Step::ErrorUpdateCallForwarding;
+
+                                Serial.print(F("SMSForwarder: Error updating voice call forwarding for privileged SMS call forwarding update request: "));
+                                Serial.println(static_cast<int>(modemResult));
+                            }
+                        }
+                        return true;
+
+                        case Step::SendSuccessMessage:
+                        case Step::SendFailureMessage:
+                        {
+                            char messageReference[3+1];
+
+                            if (parseSubmitSMSResponse(messageReference, sizeof(messageReference)))
+                            {
+                                const char* messageDestination = EEPROMConfig.destinations[messageDestinationIndex];
+
+                                Serial.print(F("SMSForwarder: Successfully sent privileged SMS result message to "));
+                                Serial.print(messageDestination);
+                                Serial.print(F(" (message reference: "));
+                                Serial.print(messageReference);
+                                Serial.println(F(")"));
+                            }
+
+                            ModemResult modemResult = parseResultFromModem();
+        
+                            if (modemResult == ModemResult::None)
+                            {
+                                return false;
+                            }
+                
+                            if (modemResult != ModemResult::OK)
+                            {
+                                Serial.print(F("SMSForwarder: Error sending privileged SMS result message: "));
+                                Serial.println(static_cast<int>(modemResult));
+                            }
+
+                            return true;
+                        }
+                        break;
+
+                        default: break;
+                    }
+
+                    return false;
+                }
+
+                virtual bool advanceToNextCommand() override
+                {
+                    switch (step)
+                    {
+                        case Step::UpdateCallForwarding:
+                            step = Step::SendSuccessMessage;
+                            return true;
+                        
+                        case Step::ErrorUpdateCallForwarding:
+                            step = Step::SendFailureMessage;
+                            return true;
+                        
+                        case Step::SendSuccessMessage:
+                            messageDestinationIndex++;
+                            step = (messageDestinationIndex < EEPROMConfigSchema::NumDestinations)
+                                ? Step::SendSuccessMessage
+                                : Step::Done;
+                            return step != Step::Done;
+
+                        case Step::SendFailureMessage:
+                            step = Step::Done;
+                            return false;
+
+                        default: break;
+                    }
+
+                    return false;
+                }
+            };
+
+            UpdateCallForwardingSMSModemCommand* modemCommand = enqueueModemCommand<UpdateCallForwardingSMSModemCommand>(destinationIndex);
+
+            if (modemCommand == nullptr)
+            {
+                Serial.println(F("SMSForwarder: Cannot send response to privileged SMS call forwarding update request (modem command queue full)"));
+                return true;
+            }
+
+            modemCommand->state = ModemCommandState::ReadyToSendCommand;
+
+            return true;
+        }
+        else
+        {
+            Serial.println(F("SMSForwarder: Privileged SMS requests status and help information"));
+
+            if (DestinationStates[destinationIndex].interactionInProgress)
+            {
+                Serial.println(F("SMSForwarder: Ignoring privileged SMS request because a prior interaction is already in progress"));
+                return true;
+            }
+
+            struct InfoSMSModemCommand : ModemCommand
+            {
+                // Telephone number of the help and info requestor
+                char destination[17+1];
+
+                // Current updated call forwarding number queried from the network
+                char callForwardingDestination[17+1];
+
+                enum struct Step : uint8_t
+                {
+                    QueryCallForwarding,
+                    SendInfoAndHelpMessage,
+                    Done,
+
+                    ErrorQueryCallForwarding,
+                    ErrorSendInfoAndHelpMessage,
+                };
+
+                Step step = Step::QueryCallForwarding;
+
+                InfoSMSModemCommand(uint8_t destinationIndex)
+                {
+                    strcpy(destination, EEPROMConfig.destinations[destinationIndex]);
+                    DestinationStates[destinationIndex].interactionInProgress = true;
+                }
+
+                virtual ~InfoSMSModemCommand() override
+                {
+                    int destinationIndex = findSMSDestination(destination);
+                    if (destinationIndex >= 0)
+                    {
+                        DestinationStates[destinationIndex].interactionInProgress = false;
+                    }
+                }
+
+                virtual bool sendCommand() override
+                {
+                    switch (step)
+                    {
+                        case Step::QueryCallForwarding:
+                        {
+                            sendQueryCallForwardingCommand();
+                        }
+                        return true;
+
+                        case Step::SendInfoAndHelpMessage:
+                        {
+                            bool destinationIsCallForwardingDestination = strcmp(destination, callForwardingDestination) == 0;
+
+                            char message[160+1];
+                            
+                            BufferPrint messagePrint(message, sizeof(message));
+                            
+                            if (destinationIsCallForwardingDestination)
+                            {
+                                messagePrint.print(F("Anrufe gehen an dich."));
+                            }
+                            else
+                            {
+                                messagePrint.print(F("Anrufe:\n"));
+                                messagePrint.print(callForwardingDestination);
+                            }
+
+                            messagePrint.print(F("\n\n"));
+                            messagePrint.print(F("SMS:"));
+
+                            for (const char* destination : EEPROMConfig.destinations)
+                            {
+                                if (destination[0] != '\0')
+                                {
+                                    messagePrint.print('\n');
+                                    messagePrint.print(destination);
+                                }
+                            }
+
+                            if (!destinationIsCallForwardingDestination)
+                            {
+                                messagePrint.print(F("\n\n"));
+                                messagePrint.print(F("Antworte \"Anrufe an mich\", um Anrufe an dich weiterzuleiten."));
+                            }
+
+                            size_t destinationLength = strlen(destination);
+                            size_t messageLength = strlen(message);
+                            return sendSubmitSMSCommand(destination, destinationLength, message, Encoding::GSMBYTES, messageLength);
+                        }
+
+                        default: break;
+                    }
+
+                    return false;
+                }
+
+                virtual bool tryProcessResponse() override
+                {
+                    switch (step)
+                    {
+                        case Step::QueryCallForwarding:
+                        {
+                            if (parseQueryCallForwardingResponse(callForwardingDestination, sizeof(callForwardingDestination)))
+                            {
+                                // Parsed call forwarding destination successfully
+                            }
+                            else
+                            {
+                                // Not the expected response
+                                return false;
+                            }
+
+                            ModemResult modemResult = parseResultFromModem();
+
+                            if (modemResult == ModemResult::OK)
+                            {
+                                Serial.print(F("SMSForwarder: Queried voice call forwarding for privileged SMS info request: "));
+                                Serial.println(callForwardingDestination);
+                            }
+                            else
+                            {
+                                step = Step::ErrorQueryCallForwarding;
+
+                                Serial.print(F("SMSForwarder: Error querying voice call forwarding for privileged SMS info request: "));
+                                Serial.println(static_cast<int>(modemResult));
+                            }
+                        }
+                        return true;
+
+                        case Step::SendInfoAndHelpMessage:
+                        {
+                            char messageReference[3+1];
+
+                            if (parseSubmitSMSResponse(messageReference, sizeof(messageReference)))
+                            {
+                                Serial.print(F("SMSForwarder: Successfully sent privileged SMS info response to "));
+                                Serial.print(destination);
+                                Serial.print(F(" (message reference: "));
+                                Serial.print(messageReference);
+                                Serial.println(F(")"));
+                            }
+
+                            ModemResult modemResult = parseResultFromModem();
+        
+                            if (modemResult == ModemResult::None)
+                            {
+                                return false;
+                            }
+                
+                            if (modemResult != ModemResult::OK)
+                            {
+                                Serial.print(F("SMSForwarder: Error sending privileged SMS info response: "));
+                                Serial.println(static_cast<int>(modemResult));
+                            }
+
+                            return true;
+                        }
+                        break;
+
+                        default: break;
+                    }
+
+                    return false;
+                }
+
+                virtual bool advanceToNextCommand() override
+                {
+                    switch (step)
+                    {
+                        case Step::QueryCallForwarding:
+                            step = Step::SendInfoAndHelpMessage;
+                            return true;
+                        
+                        case Step::SendInfoAndHelpMessage:
+                            step = Step::Done;
+                            return true;
+
+                        default: break;
+                    }
+
+                    return false;
+                }
+            };
+
+            InfoSMSModemCommand* modemCommand = enqueueModemCommand<InfoSMSModemCommand>(destinationIndex);
+
+            if (modemCommand == nullptr)
+            {
+                Serial.println(F("SMSForwarder: Cannot send response to privileged SMS info request (modem command queue full)"));
+                return true;
+            }
+
+            modemCommand->state = ModemCommandState::ReadyToSendCommand;
+
+            return true;
+        }
+
+        discardLineFromModem();
+        return true;
+    }
+    else
+    {
+        Serial.print(F("SMSForwarder: External SMS sender: "));
+        printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
+    
+        struct ForwardSMSModemCommand : ModemCommand
+        {
+            // Forwarded SMS message content including original sender
+            char message[160+1];
+            Encoding messageEncoding;
+            uint8_t messageLength;
+    
+            // Next destination index to forward SMS to
+            uint8_t destinationIndex = 0;
+    
+            virtual bool sendCommand() override
+            {
+                const char* destination = EEPROMConfig.destinations[destinationIndex];
+    
+                if (destination[0] == '\0')
+                {
+                    return false;
+                }
+    
+                Serial.print(F("SMSForwarder: Forwarding SMS to "));
+                Serial.println(destination);
+    
+                size_t destinationLength = strlen(destination);
+                return sendSubmitSMSCommand(destination, destinationLength, message, messageEncoding, messageLength);
+            }
+    
+            virtual bool tryProcessResponse() override
+            {
+                char messageReference[3+1];
+
+                if (parseSubmitSMSResponse(messageReference, sizeof(messageReference)))
+                {
+                    Serial.print(F("SMSForwarder: Successfully forwarded SMS to "));
+                    Serial.print(EEPROMConfig.destinations[destinationIndex]);
+                    Serial.print(F(" (message reference: "));
+                    Serial.print(messageReference);
+                    Serial.println(F(")"));
+                }
+        
+                ModemResult modemResult = parseResultFromModem();
+        
+                if (modemResult == ModemResult::None)
+                {
+                    return false;
+                }
+    
+                if (modemResult != ModemResult::OK)
+                {
+                    Serial.print(F("SMSForwarder: Error forwarding SMS: "));
+                    Serial.println(static_cast<int>(modemResult));
+                }
+    
+                return true;
+            }
+    
+            virtual bool advanceToNextCommand() override
+            {
+                destinationIndex++;
+                return destinationIndex < EEPROMConfigSchema::NumDestinations;
+            }
+        };
+    
+        ForwardSMSModemCommand* modemCommand = enqueueModemCommand<ForwardSMSModemCommand>();
+    
+        if (modemCommand == nullptr)
+        {
+            discardLineFromModem();
+    
+            Serial.println(F("SMSForwarder: Cannot forward SMS (modem command queue full)"));
+            return true;
+        }
+
+        // Parse incoming message into enqueued modem command to forward it
+        if (parseSMSPDUBodyFromModem(
+            hasUserDataHeader,
+            modemCommand->message, sizeof(modemCommand->message),
+            modemCommand->messageEncoding,
+            modemCommand->messageLength))
+        {
+            // Parsed SMS message successfully
+        }
+        else
+        {
+            discardLineFromModem();
+            cancelModemCommand(modemCommand);
+        
+            Serial.println(F("SMSForwarder: Unable to parse external SMS body"));
+            return true;
+        }
+
+        Serial.print(F("SMSForwarder: External SMS message: "));
+        printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding, true);
+    
         appendSenderToSMSMessage(
             sender,
             senderLength, 
@@ -2938,18 +3621,12 @@ bool tryProcessUnsolicitedReceiveSMS()
             modemCommand->messageEncoding,
             modemCommand->messageLength);
         
-        Serial.print(F("SMSForwarder: Outgoing SMS message: "));
+        Serial.print(F("SMSForwarder: Forwarded SMS message: "));
         printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding, true);
-
+    
         modemCommand->state = ModemCommandState::ReadyToSendCommand;
         return true;
     }
-
-    discardLineFromModem();
-    cancelModemCommand(modemCommand);
-
-    Serial.println(F("SMSForwarder: Unable to parse SMS"));
-    return true;
 }
 
 void setup()
@@ -3001,7 +3678,7 @@ void setupEEPROM()
             Serial.println(F(")"));
         }
 
-        memset(&EEPROMConfig, 0, sizeof(EEPROMConfig));
+        memset(&EEPROMConfig, '\0', sizeof(EEPROMConfig));
 
         EEPROMConfig.schema = EEPROMConfigSchema::ExpectedSchema;
         EEPROMConfig.version = EEPROMConfigSchema::ExpectedVersion;
