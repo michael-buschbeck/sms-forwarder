@@ -615,6 +615,32 @@ bool seekReadFromModemRollback()
     return true;
 }
 
+void fakeReadFromModemRollback(const __FlashStringHelper* string)
+{
+    char* rollbackPtr = ModemReadRollbackBuffer;
+    char* rollbackPtrEnd = ModemReadRollbackBuffer + sizeof(ModemReadRollbackBuffer);
+
+    PGM_P stringPtr = reinterpret_cast<PGM_P>(string);
+
+    while (rollbackPtr < rollbackPtrEnd)
+    {
+        char character = pgm_read_byte(stringPtr++);
+
+        if (character == '\0')
+        {
+            break;
+        }
+
+        *rollbackPtr++ = character;
+    }
+
+    // Disable collecting more into the buffer
+    ModemReadRollbackWriteOffset = sizeof(ModemReadRollbackBuffer) + 1;
+
+    ModemReadRollbackReadLength = rollbackPtr - ModemReadRollbackBuffer;
+    ModemReadRollbackReadOffset = 0;
+}
+
 int peekCharacterFromModem()
 {
     if (ModemSubStreamDataRemaining == 0)
@@ -1054,7 +1080,49 @@ wchar_t lookupUnicodeForGSM(unsigned char character, bool isExtended)
     return 0xFFFD; // REPLACEMENT CHARACTER
 }
 
-void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encoding encoding = Encoding::UTF8)
+void printCharacter(Stream& stream, char character, bool escapeSpecialCharacters)
+{
+    if (escapeSpecialCharacters)
+    {
+        switch (character)
+        {
+            /*
+            case '\0': stream.print(F("<NUL>")); return;
+            case '\t': stream.print(F("<TAB>")); return;
+            case '\r': stream.print(F("<CR>")); return;
+            case '\n': stream.print(F("<LF>")); return;
+            /*/
+            case '\0': stream.print(F("\xE2\x90\x80")); return; // U+2400 SYMBOL FOR NULL
+            case '\t': stream.print(F("\xE2\x87\xA5")); return; // U+21E5 RIGHTWARDS ARROW TO BAR
+            case '\r': stream.print(F("\xE2\x87\xA4")); return; // U+21E4 LEFTWARDS ARROW TO BAR
+            case '\n': stream.print(F("\xE2\x86\xB5")); return; // U+21B5 DOWNWARDS ARROW WITH CORNER LEFTWARDS
+            //*
+        }
+    }
+
+    stream.print(character);
+}
+
+void printUnicode(Stream& stream, wchar_t codepoint, bool escapeSpecialCharacters = false)
+{
+    if (codepoint <= 0x7F)
+    {
+        printCharacter(stream, static_cast<char>(codepoint), escapeSpecialCharacters);
+    }
+    else if (codepoint <= 0x7FF)
+    {
+        stream.write(0xC0 | (codepoint >> 6));
+        stream.write(0x80 | (codepoint & 0x3F));
+    }
+    else
+    {
+        stream.write(0xE0 | (codepoint >> 12));
+        stream.write(0x80 | ((codepoint >> 6) & 0x3F));
+        stream.write(0x80 | (codepoint & 0x3F));
+    }
+}
+
+void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encoding encoding = Encoding::UTF8, bool escapeSpecialCharacters = false)
 {
     switch (encoding)
     {
@@ -1072,7 +1140,7 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
                     break;
                 }
 
-                stream.write(character);
+                printCharacter(stream, character, escapeSpecialCharacters);
             }
         }
         return;
@@ -1091,7 +1159,7 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
                     break;
                 }
 
-                printUnicode(stream, codepoint);
+                printUnicode(stream, codepoint, escapeSpecialCharacters);
             }
         }
         break;
@@ -1110,7 +1178,7 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
                     break;
                 }
 
-                printUnicode(stream, codepoint);
+                printUnicode(stream, codepoint, escapeSpecialCharacters);
             }
         }
         break;
@@ -1138,7 +1206,7 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
                 }
 
                 wchar_t codepoint = lookupUnicodeForGSM(character, isExtended);
-                printUnicode(stream, codepoint);
+                printUnicode(stream, codepoint, escapeSpecialCharacters);
 
                 isExtended = false;
             }
@@ -1149,29 +1217,10 @@ void printEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encodin
     }
 }
 
-void printlnEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encoding encoding = Encoding::UTF8)
+void printlnEncoded(Stream& stream, const char* buffer, size_t bufferSize, Encoding encoding = Encoding::UTF8, bool escapeSpecialCharacters = false)
 {
-    printEncoded(stream, buffer, bufferSize, encoding);
+    printEncoded(stream, buffer, bufferSize, encoding, escapeSpecialCharacters);
     stream.write('\n');
-}
-
-void printUnicode(Stream& stream, wchar_t codepoint)
-{
-    if (codepoint <= 0x7F)
-    {
-        stream.write(codepoint);
-    }
-    else if (codepoint <= 0x7FF)
-    {
-        stream.write(0xC0 | (codepoint >> 6));
-        stream.write(0x80 | (codepoint & 0x3F));
-    }
-    else
-    {
-        stream.write(0xE0 | (codepoint >> 12));
-        stream.write(0x80 | ((codepoint >> 6) & 0x3F));
-        stream.write(0x80 | (codepoint & 0x3F));
-    }
 }
 
 bool isHexDigit(char character)
@@ -2667,8 +2716,16 @@ bool submitSMS(const char* destination, size_t destinationLength, const char* me
 
     if (submitPDUSize > 0)
     {
+        //*
         sendCommandToModem(F("AT+CMGS="), submitPDUSize, 120000);
         sendSMSPDUToModem(destination, destinationLength, message, messageEncoding, messageLength);
+        /*/
+        Serial.print(F("SMSForwarder DEBUG: SMS destination: "));
+        printlnEncoded(Serial, destination, destinationLength, Encoding::GSMBYTES, true);
+        Serial.print(F("SMSForwarder DEBUG: SMS message: "));
+        printlnEncoded(Serial, message, messageLength, messageEncoding, true);
+        fakeReadFromModemRollback(F("+CMGS: 255\r0\r"));
+        //*/
         return true;
     }
     else
@@ -2872,7 +2929,7 @@ bool tryProcessUnsolicitedReceiveSMS()
         Serial.print(F("GSM: SMS sender: "));
         printlnEncoded(Serial, sender, sizeof(sender), Encoding::GSMBYTES);
         Serial.print(F("GSM: SMS message: "));
-        printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding);
+        printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding, true);
 
         appendSenderToSMSMessage(
             sender,
@@ -2882,7 +2939,7 @@ bool tryProcessUnsolicitedReceiveSMS()
             modemCommand->messageLength);
         
         Serial.print(F("SMSForwarder: Outgoing SMS message: "));
-        printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding);
+        printlnEncoded(Serial, modemCommand->message, modemCommand->messageLength, modemCommand->messageEncoding, true);
 
         modemCommand->state = ModemCommandState::ReadyToSendCommand;
         return true;
