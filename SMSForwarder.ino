@@ -2476,6 +2476,13 @@ bool sendSMSPDUToModem(const char* destination, size_t destinationLength, const 
         {
             case TP_DCS_GSM7BIT:
             {
+                if (messageLength > 160)
+                {
+                    // Cancel sending
+                    ModemSerial.write(0x1B);
+                    return false;
+                }
+
                 sendHexToModem(messageLength);
                 sendGSMAlphaToModem(message, messageLength);
             }
@@ -2483,6 +2490,13 @@ bool sendSMSPDUToModem(const char* destination, size_t destinationLength, const 
 
             case TP_DCS_UCS2BE:
             {
+                if (messageLength > 140)
+                {
+                    // Cancel sending
+                    ModemSerial.write(0x1B);
+                    return false;
+                }
+
                 messageLength &= ~1;
 
                 sendHexToModem(messageLength);
@@ -2949,9 +2963,9 @@ void appendSenderToSMSMessage(const char* sender, size_t senderLength, char* mes
         case Encoding::GSMBYTES:
         {
             char* messageCharacterPtr = messageBuffer + messageLengthInOut;
-            char* messageCharacterPtrEnd = messageBuffer + messageBufferSize - 1;
+            char* messageCharacterPtrEnd = messageBuffer + min(160, messageBufferSize - sizeof(char));
 
-            if (messageCharacterPtr + senderLength + 2 < messageCharacterPtrEnd)
+            if (messageCharacterPtr + senderLength + 2 * sizeof('\n') < messageCharacterPtrEnd)
             {
                 *messageCharacterPtr++ = '\n';
                 *messageCharacterPtr++ = '\n';
@@ -2969,9 +2983,9 @@ void appendSenderToSMSMessage(const char* sender, size_t senderLength, char* mes
         case Encoding::UCS2BE:
         {
             wchar_t* messageCodepointPtr = reinterpret_cast<wchar_t*>(messageBuffer + messageLengthInOut);
-            wchar_t* messageCodepointPtrEnd = reinterpret_cast<wchar_t*>(messageBuffer + messageBufferSize) - 1;
+            wchar_t* messageCodepointPtrEnd = reinterpret_cast<wchar_t*>(messageBuffer + min(140, messageBufferSize - sizeof(wchar_t)));
 
-            if (messageCodepointPtr + senderLength + 2 < messageCodepointPtrEnd)
+            if (messageCodepointPtr + senderLength + 2 * sizeof('\n') < messageCodepointPtrEnd)
             {
                 *messageCodepointPtr++ = swapBytes('\n');
                 *messageCodepointPtr++ = swapBytes('\n');
